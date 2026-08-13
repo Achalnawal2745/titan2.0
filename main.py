@@ -1,4 +1,8 @@
 import os
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
+os.environ["OMP_NUM_THREADS"] = "1"
 import platform as _platform
 import subprocess as _subprocess
 import warnings
@@ -107,6 +111,47 @@ def _clean_transcript(text: str) -> str:
     return text.strip()
 
 TOOL_DECLARATIONS = [
+    {
+        "name": "ui_automation",
+        "description": (
+            "Interacts with Windows desktop apps programmatically via Windows Accessibility UIA tree "
+            "WITHOUT moving or stealing the user's physical mouse. "
+            "Actions: 'click' (click button/element), 'type' (paste text into input box), "
+            "'get_text' (read text from element), 'dump_tree' (inspect UI accessibility tree)."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "action": {"type": "STRING", "description": "click | type | get_text | dump_tree"},
+                "app_name": {"type": "STRING", "description": "Target application name (e.g. 'Calculator', 'Notepad', 'Chrome')"},
+                "element_name": {"type": "STRING", "description": "Title or button label to interact with (e.g. 'Seven', 'Edit', 'Submit')"},
+                "text": {"type": "STRING", "description": "Text to type into an edit box or search query for dump_tree"},
+                "index": {"type": "INTEGER", "description": "Index if multiple elements match the same name (default 0)"}
+            },
+            "required": ["action", "app_name"]
+        }
+    },
+    {
+        "name": "smart_task",
+        "description": (
+            "Autonomous multi-step reasoning task pipeline for documents. "
+            "Actions: 'answer_questions_in_doc' (extracts & answers questions into Word doc), "
+            "'summarize_document' (summarizes file into Word doc), "
+            "'rewrite_document' (transforms/translates file into Word doc), "
+            "'generate_document' (writes full document on topic into Word doc)."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "action": {"type": "STRING", "description": "answer_questions_in_doc | summarize_document | rewrite_document | generate_document"},
+                "source_path": {"type": "STRING", "description": "Input document path (.pdf, .docx, .txt)"},
+                "output_path": {"type": "STRING", "description": "Output .docx file path"},
+                "topic": {"type": "STRING", "description": "Topic for document generation"},
+                "instruction": {"type": "STRING", "description": "Instruction for rewrite/transformation"}
+            },
+            "required": ["action"]
+        }
+    },
     {
         "name": "open_app",
         "description": (
@@ -357,7 +402,7 @@ TOOL_DECLARATIONS = [
     },
     {
         "name": "computer_control",
-        "description": "Direct computer control: type, click, hotkeys, scroll, move mouse, screenshots, find elements on screen.",
+        "description": "FALLBACK raw mouse/keyboard control. ALWAYS USE 'ui_automation' FIRST for clicking or typing in desktop apps (Notepad, Calculator, Word) so the mouse is NOT hijacked. Use computer_control ONLY for global hotkeys, scrolling, or raw fallback mouse movement.",
         "parameters": {
             "type": "OBJECT",
             "properties": {
@@ -917,6 +962,32 @@ class TitanLive:
                     None,
                     lambda: file_processor(parameters=args, player=self.ui, speak=self.speak)
                 )
+                result = r or "Done."
+
+            elif name == "ui_automation":
+                from actions import ui_automation as uia
+                action = args.get("action", "click")
+                app_name = args.get("app_name", "")
+                element_name = args.get("element_name", "")
+                text = args.get("text", "")
+                index = args.get("index", 0)
+
+                if action == "click":
+                    r = await loop.run_in_executor(None, lambda: uia.ui_click(app_name, element_name, index))
+                elif action == "type":
+                    r = await loop.run_in_executor(None, lambda: uia.ui_type(app_name, element_name, text))
+                elif action == "get_text":
+                    r = await loop.run_in_executor(None, lambda: uia.ui_get_text(app_name, element_name))
+                elif action == "dump_tree":
+                    r = await loop.run_in_executor(None, lambda: uia.ui_dump_tree(app_name, search_query=text))
+                else:
+                    r = f"Unknown action: {action}"
+                result = r or "Done."
+
+            elif name == "smart_task":
+                import task_planner
+                api_key = get_config().get("api_key", "")
+                r = await loop.run_in_executor(None, lambda: task_planner.run_smart_task(args, api_key))
                 result = r or "Done."
 
             elif name == "computer_control":

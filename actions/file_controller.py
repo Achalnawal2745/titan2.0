@@ -304,6 +304,20 @@ def write_file(path: str, name: str = "", content: str = "",
         if not _is_safe_path(target):
             return f"Access denied: {target}"
         target.parent.mkdir(parents=True, exist_ok=True)
+
+        # ── Word (.docx) safe writer fix ───────────────────────────────────────
+        if target.suffix.lower() in (".docx", ".doc"):
+            try:
+                import sys
+                from pathlib import Path
+                root_dir = Path(__file__).resolve().parent.parent
+                if str(root_dir) not in sys.path:
+                    sys.path.insert(0, str(root_dir))
+                import doc_engine
+                return doc_engine.create_word_from_markdown(str(target), content, open_after=True)
+            except Exception as doc_err:
+                print(f"[file_controller] doc_engine write fallback: {doc_err}")
+
         mode = "a" if append else "w"
         with open(target, mode, encoding="utf-8") as f:
             f.write(content)

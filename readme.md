@@ -1,7 +1,7 @@
 # ⚡ TITAN 2.0
 ### Next-Generation Autonomous AI Assistant & System Controller
 
-TITAN 2.0 is a real-time, multimodal personal AI assistant engineered for full system automation, visual awareness, biometric security, and browser interaction. Powered by the Google Gemini Live API for low-latency audio streaming, TITAN operates as a persistent desktop presence capable of hearing, seeing, understanding, and controlling your PC.
+TITAN 2.0 is a real-time, multimodal personal AI assistant engineered for full system automation, visual awareness, biometric security, document intelligence, and browser interaction. Powered by the Google Gemini Live API for low-latency audio streaming, TITAN operates as a persistent desktop presence capable of hearing, seeing, understanding, and controlling your PC.
 
 ---
 
@@ -11,6 +11,13 @@ TITAN 2.0 is a real-time, multimodal personal AI assistant engineered for full s
 * **Native Audio Streaming**: Sub-50ms conversational speech loop via Gemini Live WebSocket API.
 * **GMM Voice Biometrics**: Gaussian Mixture Model (`sklearn.mixture.GaussianMixture`) speaker verification filters unrecognized background voices.
 * **Instant Interrupt**: Press `Esc` or click `Interrupt` to clear audio playback and send server-side turn cancellation instantly.
+
+### 🖱️ Background UI Accessibility Automation
+* **Zero Mouse Hijacking**: Uses Windows Accessibility API (`pywinauto` / UIAutomation) to click buttons, inspect trees, and paste text inside desktop apps without moving your physical mouse pointer.
+
+### 📄 Document Intelligence & Autonomous Task Pipeline
+* **Vision PDF & Document Parser**: Parses `.pdf`, `.docx`, `.pptx`, `.xlsx` using **Docling (Vision-based PDF parser)** & **Unstructured**.
+* **Smart Word Report Generator**: Automatically answers questions inside documents, transforms formats, and exports styled `.docx` Word documents (`task_planner.py` & `doc_engine.py`).
 
 ### 🛡️ Biometric Security & Lock Screen
 * **YuNet DNN Face ID**: Real-time facial embedding comparison using OpenCV YuNet DNN.
@@ -22,26 +29,20 @@ TITAN 2.0 is a real-time, multimodal personal AI assistant engineered for full s
 * **Auto-Index Element Clicking**: Inspects Chrome DOM tree and auto-resolves numeric `highlightIndex` for buttons, inputs, and email rows.
 * **Full Browser Automation**: Navigate tabs, extract web content, fill forms, and control web apps by voice.
 
-### 👁️ Visual & Screen Intelligence
-* **Screen & Webcam Vision**: Instant screen captures piped directly into Gemini Live session.
-* **Smart Vision Response**: Immediate natural voice acknowledgment ("Looking at your screen...") while capture runs in parallel.
-
-### 📊 System Telemetry & Automation
-* **Hardware Monitoring**: Real-time telemetry for CPU, RAM, GPU, and temperature with voice alerts.
-* **OS Automation**: Launch applications, adjust volume/brightness, manage Wi-Fi, power state, and execute system commands.
-* **Smart Reminders**: Scheduled notifications integrated with native OS schedulers.
-
 ---
 
 ## 🗂️ Project Architecture
 
 ```text
 titan2.0/
-├── main.py                   # Core loop — Gemini Live session, audio I/O, tool dispatch & startup security gate
-├── ui.py                     # PyQt6 HUD — waveform display, log panel, camera feed & Lock Screen UI
+├── main.py                   # Core loop — Gemini Live session, tool dispatch & startup gate
+├── ui.py                     # PyQt6 HUD — waveform display, log panel & futuristic command center UI
+├── doc_engine.py             # Docling & Unstructured document reader and formatted Word (.docx) generator
+├── task_planner.py           # Multi-step document reasoning & answer extraction pipeline
 ├── shadow_bridge.py          # Embedded Neural WebSocket Bridge (Port 8002) for Chrome Extension control
 ├── setup.py                  # Initial setup and wizard
 ├── actions/
+│   ├── ui_automation.py      # Windows Accessibility UIA background control (zero mouse hijacking)
 │   ├── shadow_link.py        # Chrome DOM navigation & auto-index element resolver
 │   ├── voice_face_id.py      # GMM Speaker Voice Recognition & YuNet DNN Face ID Security
 │   ├── web_search.py         # Grounded Google & DuckDuckGo parallel web search
@@ -74,12 +75,6 @@ titan2.0/
 
 ## ⚡ Quick Start & Installation
 
-### 1. Prerequisites
-* **OS**: Windows 10/11, macOS, or Linux
-* **Python**: Python 3.11 or 3.12
-* **Hardware**: Microphone & Webcam (optional for Face ID)
-
-### 2. Setup & Installation
 ```bash
 # Clone the repository
 git clone https://github.com/Achalnawal2745/titan2.0.git
@@ -91,24 +86,6 @@ pip install -r requirements.txt
 # Launch TITAN 2.0
 python main.py
 ```
-
-### 3. API Configuration
-Add your Gemini API key in `config/api_keys.json`:
-```json
-{
-  "api_key": "YOUR_GEMINI_API_KEY",
-  "assistant_name": "TITAN",
-  "user_name": "Achal"
-}
-```
-
----
-
-## 🔒 Security & Privacy Features
-
-* **Local Embedding Processing**: Facial features and acoustic GMM voice models are computed and saved locally on your device (`memory/owner_face.npy`, `memory/owner_voice_gmm.pkl`).
-* **Modal Settings Protection**: Re-authentication is enforced before modifying enrolled face/voice data or changing passcodes.
-* **Strict Startup Gate**: If Master Security Lock is enabled, TITAN blocks desktop access on boot until identity is verified.
 
 ---
 
