@@ -60,27 +60,27 @@ _OS = platform.system()  # "Windows" | "Darwin" | "Linux"
 
 
 class C:
-    BG        = "#00060a"
-    PANEL     = "#010d14"
-    PANEL2    = "#010f18"
-    BORDER    = "#0d3347"
-    BORDER_B  = "#1a5c7a"
-    BORDER_A  = "#0f4060"
-    PRI       = "#00d4ff"
-    PRI_DIM   = "#007a99"
-    PRI_GHO   = "#001f2e"
-    ACC       = "#ff6b00"
-    ACC2      = "#ffcc00"
-    GREEN     = "#00ff88"
-    GREEN_D   = "#00aa55"
-    RED       = "#ff3355"
+    BG        = "#05070a"
+    PANEL     = "#0c0f16"
+    PANEL2    = "#121622"
+    BORDER    = "#162a3a"
+    BORDER_B  = "#204a60"
+    BORDER_A  = "#123246"
+    PRI       = "#00f0ff"
+    PRI_DIM   = "#008299"
+    PRI_GHO   = "#041c28"
+    ACC       = "#bc13fe"
+    ACC2      = "#7000ff"
+    GREEN     = "#00ff9d"
+    GREEN_D   = "#00aa66"
+    RED       = "#ff3366"
     MUTED_C   = "#ff3366"
-    TEXT      = "#8ffcff"
-    TEXT_DIM  = "#3a8a9a"
-    TEXT_MED  = "#5ab8cc"
-    WHITE     = "#d8f8ff"
-    DARK      = "#000d14"
-    BAR_BG    = "#011520"
+    TEXT      = "#e1f8ff"
+    TEXT_DIM  = "#4e7e8c"
+    TEXT_MED  = "#6a9eb0"
+    WHITE     = "#ffffff"
+    DARK      = "#090c12"
+    BAR_BG    = "#0d141f"
 
 
 # Ana renge (accent) bağlı anahtarlar — durum renkleri (ACC, GREEN, RED…) sabit kalır
@@ -338,7 +338,7 @@ class _SysMetrics:
 _metrics = _SysMetrics()
 
 class HudCanvas(QWidget):
-    def __init__(self, face_path: str, assistant_name: str = "J.A.R.V.I.S", parent=None):
+    def __init__(self, face_path: str, assistant_name: str = "TITAN", parent=None):
         super().__init__(parent)
         self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent)
         self.setMinimumSize(300, 300)
@@ -1053,7 +1053,7 @@ class SetupOverlay(QWidget):
             return w
 
         layout.addWidget(_lbl("◈  INITIALISATION REQUIRED", 13, True))
-        layout.addWidget(_lbl("Configure J.A.R.V.I.S. before first boot.", 9, color=C.PRI_DIM))
+        layout.addWidget(_lbl("Configure TITAN before first boot.", 9, color=C.PRI_DIM))
         layout.addSpacing(6)
 
         sep = QFrame(); sep.setFrameShape(QFrame.Shape.HLine)
@@ -1836,7 +1836,7 @@ class LockScreenDialog(QDialog):
         self.setFixedSize(500, 420)
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.Dialog)
         self.setWindowModality(Qt.WindowModality.ApplicationModal)
-        self.setStyleSheet("background: #000d14; border: 2px solid #00d4ff; border-radius: 10px;")
+        self.setStyleSheet(f"background: {C.PANEL}; border: 2px solid {C.PRI}; border-radius: 12px;")
         self.authenticated = False
 
         # Center lock screen dialog inside parent TITAN window
@@ -1855,13 +1855,13 @@ class LockScreenDialog(QDialog):
 
         hdr = QLabel("🔒 TITAN SECURITY LOCK")
         hdr.setFont(QFont("Courier New", 14, QFont.Weight.Bold))
-        hdr.setStyleSheet("color: #00d4ff; background: transparent;")
+        hdr.setStyleSheet(f"color: {C.PRI}; background: transparent;")
         hdr.setAlignment(Qt.AlignmentFlag.AlignCenter)
         lay.addWidget(hdr)
 
         sub = QLabel("AUTHENTICATION REQUIRED TO ACCESS TITAN")
         sub.setFont(QFont("Courier New", 8))
-        sub.setStyleSheet("color: #3a8a9a; background: transparent;")
+        sub.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent;")
         sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
         lay.addWidget(sub)
 
@@ -2380,7 +2380,7 @@ class MainWindow(QMainWindow):
             sc.TargetPath       = target
             sc.Arguments        = f'"{args}"'
             sc.WorkingDirectory = work_dir
-            sc.Description      = "J.A.R.V.I.S AI Assistant"
+            sc.Description      = "TITAN 2.0 AI Assistant"
             sc.IconLocation     = icon_loc
             sc.save()
             return
@@ -2395,7 +2395,7 @@ class MainWindow(QMainWindow):
             f'sc.TargetPath = "{target}"',
             f'sc.Arguments = Chr(34) & "{args}" & Chr(34)',
             f'sc.WorkingDirectory = "{work_dir}"',
-            'sc.Description = "J.A.R.V.I.S AI Assistant"',
+            'sc.Description = "TITAN 2.0 AI Assistant"',
             f'sc.IconLocation = "{icon_loc}"',
             'sc.Save',
         ])
@@ -2518,14 +2518,14 @@ class MainWindow(QMainWindow):
             if _os == "Windows":
                 pythonw  = python.parent / "pythonw.exe"
                 target   = str(pythonw if pythonw.exists() else python)
-                lnk      = str(desktop / "J.A.R.V.I.S.lnk")
+                lnk      = str(desktop / "TITAN.lnk")
                 icon_loc = str(ico_path) if ico_path.exists() else f"{target},0"
                 self._create_lnk_windows(lnk, target, str(script),
                                          str(script.parent), icon_loc)
 
             # ── macOS — proper .app bundle (no Terminal window) ───────────────
             elif _os == "Darwin":
-                app     = desktop / "J.A.R.V.I.S.app"
+                app     = desktop / "TITAN.app"
                 mac_dir = app / "Contents" / "MacOS"
                 res_dir = app / "Contents" / "Resources"
                 mac_dir.mkdir(parents=True, exist_ok=True)
@@ -2551,7 +2551,7 @@ class MainWindow(QMainWindow):
                     '  <key>CFBundleExecutable</key><string>TITAN</string>\n'
                     '  <key>CFBundleIdentifier</key>'
                     '<string>com.titan.assistant</string>\n'
-                    '  <key>CFBundleName</key><string>J.A.R.V.I.S</string>\n'
+                    '  <key>CFBundleName</key><string>TITAN</string>\n'
                     '  <key>CFBundlePackageType</key><string>APPL</string>\n'
                     '  <key>CFBundleVersion</key><string>1.0</string>\n'
                     '</dict></plist>\n'
@@ -2589,10 +2589,10 @@ class MainWindow(QMainWindow):
                         png_path = ico_path  # fallback to .ico
 
                 icon_line = f"Icon={png_path}\n" if png_path.exists() else ""
-                desk = desktop / "J.A.R.V.I.S.desktop"
+                desk = desktop / "TITAN.desktop"
                 desk.write_text(
                     "[Desktop Entry]\n"
-                    "Name=J.A.R.V.I.S\n"
+                    "Name=TITAN\n"
                     f"Exec={python} {script}\n"
                     f"Path={script.parent}\n"
                     "Type=Application\n"
@@ -2704,63 +2704,94 @@ class MainWindow(QMainWindow):
 
     def _build_header(self) -> QWidget:
         w = QWidget()
-        w.setFixedHeight(54)
-        w.setStyleSheet(f"background: {C.DARK}; border-bottom: 1px solid {C.BORDER_B};")
+        w.setFixedHeight(60)
+        w.setStyleSheet(f"""
+            QWidget {{
+                background: {C.PANEL};
+                border-bottom: 2px solid {C.PRI};
+            }}
+        """)
         lay = QHBoxLayout(w)
-        lay.setContentsMargins(16, 0, 16, 0)
+        lay.setContentsMargins(18, 0, 18, 0)
+        lay.setSpacing(10)
 
-        def _badge(txt, color=C.TEXT_MED):
-            l = QLabel(txt)
-            l.setFont(QFont("Courier New", 8))
-            l.setStyleSheet(f"color: {color}; background: transparent;")
-            return l
+        # Left brand container
+        brand_box = QHBoxLayout(); brand_box.setSpacing(8)
+        self._brand_lbl = QLabel("◈ TITAN 2.0")
+        self._brand_lbl.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
+        self._brand_lbl.setStyleSheet(f"""
+            color: {C.PRI};
+            background: {C.PRI_GHO};
+            border: 1px solid {C.PRI_DIM};
+            border-radius: 6px;
+            padding: 4px 10px;
+        """)
+        brand_box.addWidget(self._brand_lbl)
 
-        lay.addWidget(_badge("TITAN 2.0", C.PRI_DIM))
-        lay.addSpacing(8)
-        self._drawer_btn = QPushButton("⚙")
-        self._drawer_btn.setFixedSize(26, 26)
-        self._drawer_btn.setFont(QFont("Courier New", 11))
+        self._drawer_btn = QPushButton("⚙  SETTINGS")
+        self._drawer_btn.setFixedHeight(28)
+        self._drawer_btn.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
         self._drawer_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._drawer_btn.setToolTip("Settings & Controls")
+        self._drawer_btn.setToolTip("Quick Settings & Security Controls")
         self._drawer_btn.setStyleSheet(f"""
             QPushButton {{
-                background: transparent; color: {C.TEXT_DIM};
-                border: 1px solid {C.BORDER}; border-radius: 4px;
+                background: {C.PANEL2}; color: {C.TEXT_MED};
+                border: 1px solid {C.BORDER}; border-radius: 6px;
+                padding: 0 10px;
             }}
-            QPushButton:hover {{ color: {C.PRI}; border-color: {C.PRI_DIM}; }}
-            QPushButton:checked {{ color: {C.PRI}; border-color: {C.PRI}; background: {C.PRI_GHO}; }}
+            QPushButton:hover {{ color: {C.PRI}; border-color: {C.PRI}; background: {C.PRI_GHO}; }}
+            QPushButton:checked {{ color: {C.WHITE}; border-color: {C.PRI}; background: {C.PRI_DIM}; }}
         """)
         self._drawer_btn.setCheckable(True)
         self._drawer_btn.clicked.connect(self._toggle_drawer)
-        lay.addWidget(self._drawer_btn)
+        brand_box.addWidget(self._drawer_btn)
+        lay.addLayout(brand_box)
+
         lay.addStretch()
 
-        mid = QVBoxLayout(); mid.setSpacing(1)
+        # Center Assistant Title & Status Pill
+        mid = QVBoxLayout(); mid.setSpacing(2)
         _disp = self._assistant_name.upper()
         self._title_lbl = QLabel(_disp)
         self._title_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._title_lbl.setFont(QFont("Courier New", 17, QFont.Weight.Bold))
-        self._title_lbl.setStyleSheet(f"color: {C.PRI}; background: transparent;")
+        self._title_lbl.setFont(QFont("Segoe UI", 18, QFont.Weight.Bold))
+        self._title_lbl.setStyleSheet(f"color: {C.PRI}; background: transparent; letter-spacing: 2px;")
         mid.addWidget(self._title_lbl)
+
         _sub_text = ("Just A Rather Very Intelligent System"
                      if _disp in ("TITAN", "J.A.R.V.I.S")
                      else "Personal AI Assistant")
         self._sub_lbl = QLabel(_sub_text)
         self._sub_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._sub_lbl.setFont(QFont("Courier New", 7))
-        self._sub_lbl.setStyleSheet(f"color: {C.PRI_DIM}; background: transparent;")
+        self._sub_lbl.setFont(QFont("Segoe UI", 7))
+        self._sub_lbl.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent;")
         mid.addWidget(self._sub_lbl)
+
+        self._status_pill = QLabel("🟢  AI CORE: ONLINE  ·  SEC: CLEARED")
+        self._status_pill.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._status_pill.setFont(QFont("Segoe UI", 7, QFont.Weight.Bold))
+        self._status_pill.setStyleSheet(f"""
+            color: {C.GREEN};
+            background: rgba(0, 255, 157, 0.08);
+            border: 1px solid {C.GREEN_D};
+            border-radius: 10px;
+            padding: 2px 10px;
+        """)
+        mid.addWidget(self._status_pill)
         lay.addLayout(mid)
+
         lay.addStretch()
 
-        right_col = QVBoxLayout(); right_col.setSpacing(2)
+        # Right Digital Clock & Date Display
+        right_col = QVBoxLayout(); right_col.setSpacing(1)
         self._clock_lbl = QLabel("00:00:00")
-        self._clock_lbl.setFont(QFont("Courier New", 14, QFont.Weight.Bold))
+        self._clock_lbl.setFont(QFont("Segoe UI", 15, QFont.Weight.Bold))
         self._clock_lbl.setStyleSheet(f"color: {C.PRI}; background: transparent;")
         self._clock_lbl.setAlignment(Qt.AlignmentFlag.AlignRight)
         right_col.addWidget(self._clock_lbl)
+
         self._date_lbl = QLabel("")
-        self._date_lbl.setFont(QFont("Courier New", 7))
+        self._date_lbl.setFont(QFont("Segoe UI", 7, QFont.Weight.Bold))
         self._date_lbl.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent;")
         self._date_lbl.setAlignment(Qt.AlignmentFlag.AlignRight)
         right_col.addWidget(self._date_lbl)
@@ -2774,17 +2805,23 @@ class MainWindow(QMainWindow):
     def _build_left_panel(self) -> QWidget:
         w = QWidget()
         w.setFixedWidth(_LEFT_W)
-        w.setStyleSheet(f"background: {C.DARK}; border-right: 1px solid {C.BORDER};")
+        w.setStyleSheet(f"""
+            QWidget {{
+                background: {C.PANEL};
+                border-right: 1px solid {C.BORDER};
+            }}
+        """)
         lay = QVBoxLayout(w)
-        lay.setContentsMargins(8, 10, 8, 10)
-        lay.setSpacing(6)
+        lay.setContentsMargins(10, 12, 10, 12)
+        lay.setSpacing(8)
 
-        hdr = QLabel("◈ SYS MONITOR")
-        hdr.setFont(QFont("Courier New", 7, QFont.Weight.Bold))
-        hdr.setStyleSheet(f"color: {C.PRI}; background: transparent; "
-                          f"border-bottom: 1px solid {C.BORDER}; padding-bottom: 4px;")
+        hdr = QLabel("◈  TELEMETRY")
+        hdr.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
+        hdr.setStyleSheet(f"""
+            color: {C.PRI}; background: transparent;
+            border-bottom: 1px solid {C.BORDER}; padding-bottom: 6px;
+        """)
         lay.addWidget(hdr)
-        lay.addSpacing(2)
 
         self._bar_cpu = MetricBar("CPU", C.PRI)
         self._bar_mem = MetricBar("MEM", C.ACC2)
@@ -2799,64 +2836,55 @@ class MainWindow(QMainWindow):
         lay.addSpacing(4)
 
         info_panel = QWidget()
-        info_panel.setStyleSheet(
-            f"background: {C.PANEL2}; border: 1px solid {C.BORDER}; border-radius: 4px;"
-        )
+        info_panel.setStyleSheet(f"""
+            background: {C.PANEL2};
+            border: 1px solid {C.BORDER_A};
+            border-radius: 8px;
+        """)
         ip_lay = QVBoxLayout(info_panel)
-        ip_lay.setContentsMargins(6, 5, 6, 5)
-        ip_lay.setSpacing(3)
+        ip_lay.setContentsMargins(8, 6, 8, 6)
+        ip_lay.setSpacing(4)
 
         self._uptime_lbl = QLabel("UP  --:--")
-        self._uptime_lbl.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
+        self._uptime_lbl.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
         self._uptime_lbl.setStyleSheet(f"color: {C.GREEN}; background: transparent; border: none;")
         ip_lay.addWidget(self._uptime_lbl)
 
         self._proc_lbl = QLabel("PROC  --")
-        self._proc_lbl.setFont(QFont("Courier New", 8))
+        self._proc_lbl.setFont(QFont("Segoe UI", 8))
         self._proc_lbl.setStyleSheet(f"color: {C.TEXT_MED}; background: transparent; border: none;")
         ip_lay.addWidget(self._proc_lbl)
 
         os_name = {"Windows": "WIN", "Darwin": "macOS", "Linux": "LINUX"}.get(_OS, _OS.upper())
         os_lbl = QLabel(f"OS  {os_name}")
-        os_lbl.setFont(QFont("Courier New", 8))
+        os_lbl.setFont(QFont("Segoe UI", 8))
         os_lbl.setStyleSheet(f"color: {C.ACC2}; background: transparent; border: none;")
         ip_lay.addWidget(os_lbl)
 
         lay.addWidget(info_panel)
-        lay.addSpacing(4)
 
         lay.addStretch()
-
-        for txt, col in [
-            ("AI CORE\nACTIVE",  C.GREEN),
-            ("SEC\nCLEARED",     C.PRI),
-            ("PROTOCOL\nXLIX",   C.TEXT_DIM),
-        ]:
-            lbl = QLabel(txt)
-            lbl.setFont(QFont("Courier New", 7, QFont.Weight.Bold))
-            lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            lbl.setStyleSheet(
-                f"color: {col}; background: {C.PANEL2};"
-                f"border: 1px solid {C.BORDER_A}; border-radius: 3px; padding: 4px;"
-            )
-            lay.addWidget(lbl)
-
         return w
     def _build_right_panel(self) -> QWidget:
         w = QWidget()
         w.setFixedWidth(_RIGHT_W)
-        w.setStyleSheet(f"background: {C.DARK}; border-left: 1px solid {C.BORDER};")
+        w.setStyleSheet(f"""
+            QWidget {{
+                background: {C.PANEL};
+                border-left: 1px solid {C.BORDER};
+            }}
+        """)
         lay = QVBoxLayout(w)
-        lay.setContentsMargins(8, 8, 8, 8)
-        lay.setSpacing(6)
+        lay.setContentsMargins(10, 12, 10, 12)
+        lay.setSpacing(8)
 
         def _sec(txt):
-            l = QLabel(f"▸ {txt}")
-            l.setFont(QFont("Courier New", 7, QFont.Weight.Bold))
-            l.setStyleSheet(f"color: {C.TEXT_MED}; background: transparent;")
+            l = QLabel(f"◈  {txt}")
+            l.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
+            l.setStyleSheet(f"color: {C.PRI}; background: transparent;")
             return l
 
-        lay.addWidget(_sec("ACTIVITY LOG"))
+        lay.addWidget(_sec("ACTIVITY STREAM"))
         self._log = LogWidget()
         lay.addWidget(self._log, stretch=1)
 
@@ -2864,14 +2892,14 @@ class MainWindow(QMainWindow):
         sep.setStyleSheet(f"color: {C.BORDER}; margin: 2px 0;")
         lay.addWidget(sep)
 
-        lay.addWidget(_sec("FILE UPLOAD"))
+        lay.addWidget(_sec("FILE UPLOAD ZONE"))
         self._drop_zone = FileDropZone()
         self._drop_zone.file_selected.connect(self._on_file_selected)
         lay.addWidget(self._drop_zone)
 
-        self._file_hint = QLabel("No file loaded — drop or click above to upload")
-        self._file_hint.setFont(QFont("Courier New", 7))
-        self._file_hint.setStyleSheet(f"color: {C.TEXT_MED}; background: transparent;")
+        self._file_hint = QLabel("Drop files above or click to select")
+        self._file_hint.setFont(QFont("Segoe UI", 7))
+        self._file_hint.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent;")
         self._file_hint.setWordWrap(True)
         lay.addWidget(self._file_hint)
 
@@ -2884,26 +2912,29 @@ class MainWindow(QMainWindow):
 
         self._interrupt_btn = QPushButton("✋  INTERRUPT  [ESC]")
         self._interrupt_btn.setFixedHeight(34)
-        self._interrupt_btn.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
+        self._interrupt_btn.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
         self._interrupt_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._interrupt_btn.setStyleSheet(f"""
             QPushButton {{
-                background: #140008; color: {C.MUTED_C};
-                border: 1px solid {C.MUTED_C}; border-radius: 3px;
+                background: rgba(255, 51, 102, 0.1);
+                color: {C.RED};
+                border: 1px solid {C.RED};
+                border-radius: 6px;
             }}
             QPushButton:hover {{
-                background: #200010; border: 1px solid #ff6688;
+                background: rgba(255, 51, 102, 0.22);
+                border-color: #ff6688;
             }}
             QPushButton:pressed {{
-                background: #300018;
+                background: rgba(255, 51, 102, 0.4);
             }}
         """)
         self._interrupt_btn.clicked.connect(self._do_interrupt)
         lay.addWidget(self._interrupt_btn)
 
         self._mute_btn = QPushButton("🎙  MICROPHONE ACTIVE")
-        self._mute_btn.setFixedHeight(30)
-        self._mute_btn.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
+        self._mute_btn.setFixedHeight(32)
+        self._mute_btn.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
         self._mute_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._mute_btn.clicked.connect(self._toggle_mute)
         self._style_mute_btn()
@@ -3084,31 +3115,31 @@ class MainWindow(QMainWindow):
         self._quick_drawer.setGeometry(12, 54, _W, self._quick_drawer.sizeHint().height())
 
     def _build_input_row(self) -> QHBoxLayout:
-        row = QHBoxLayout(); row.setSpacing(5)
+        row = QHBoxLayout(); row.setSpacing(6)
         self._input = QLineEdit()
-        self._input.setPlaceholderText("Type a command or question…")
-        self._input.setFont(QFont("Courier New", 9))
-        self._input.setFixedHeight(30)
+        self._input.setPlaceholderText("Ask TITAN anything or type a command…")
+        self._input.setFont(QFont("Segoe UI", 9))
+        self._input.setFixedHeight(34)
         self._input.setStyleSheet(f"""
             QLineEdit {{
-                background: #000d14; color: {C.WHITE};
-                border: 1px solid {C.BORDER}; border-radius: 3px; padding: 3px 7px;
+                background: {C.PANEL2}; color: {C.WHITE};
+                border: 1px solid {C.BORDER_A}; border-radius: 6px; padding: 4px 10px;
             }}
-            QLineEdit:focus {{ border: 1px solid {C.PRI}; }}
+            QLineEdit:focus {{ border: 1px solid {C.PRI}; background: {C.PANEL}; }}
         """)
         self._input.returnPressed.connect(self._send)
         row.addWidget(self._input)
 
-        send = QPushButton("▸")
-        send.setFixedSize(30, 30)
-        send.setFont(QFont("Courier New", 11, QFont.Weight.Bold))
+        send = QPushButton("SEND")
+        send.setFixedSize(54, 34)
+        send.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
         send.setCursor(Qt.CursorShape.PointingHandCursor)
         send.setStyleSheet(f"""
             QPushButton {{
-                background: {C.PANEL}; color: {C.PRI};
-                border: 1px solid {C.PRI_DIM}; border-radius: 3px;
+                background: {C.PRI_GHO}; color: {C.PRI};
+                border: 1px solid {C.PRI_DIM}; border-radius: 6px;
             }}
-            QPushButton:hover {{ background: {C.PRI_GHO}; border: 1px solid {C.PRI}; }}
+            QPushButton:hover {{ background: {C.PRI_DIM}; color: {C.WHITE}; border-color: {C.PRI}; }}
         """)
         send.clicked.connect(self._send)
         row.addWidget(send)
@@ -3603,10 +3634,11 @@ class MainWindow(QMainWindow):
         display = self._assistant_name.upper()
         self.setWindowTitle(f"{display} — TITAN 2.0")
         self._title_lbl.setText(display)
-        if display in ("TITAN", "J.A.R.V.I.S"):
-            self._sub_lbl.setText("Just A Rather Very Intelligent System")
-        else:
-            self._sub_lbl.setText("Personal AI Assistant")
+        if hasattr(self, "_sub_lbl") and self._sub_lbl:
+            if display in ("TITAN", "J.A.R.V.I.S"):
+                self._sub_lbl.setText("Just A Rather Very Intelligent System")
+            else:
+                self._sub_lbl.setText("Personal AI Assistant")
         self._log._ai_name_lc = self._assistant_name.lower()
         self.hud._assistant_name = display
 
