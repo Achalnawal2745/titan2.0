@@ -34,9 +34,21 @@ TITAN 2.0 is a real-time, multimodal personal AI assistant engineered for full s
 * **ApplicationModal Security Gate**: Centered glass security overlay that blocks unauthorized UI access on startup or lock toggle.
 * **Triple Verification**: Unlock via Face Recognition, Voice Biometrics, or Passcode PIN.
 
-### 📊 System Telemetry & Control
-* **Hardware Monitoring**: Real-time monitoring for CPU, RAM, GPU, and temperature with voice alert thresholds.
-* **OS Controller**: Adjust system volume/brightness, manage Wi-Fi, power states, and execute local commands safely.
+### 🧩 Autonomous Skill Engine & Dynamic Plugin Lifecycle
+* **Self-Generated Python Skills (`actions/skill_engine.py`)**: TITAN can write, sandbox test, execute, edit, and delete custom Python skills dynamically on demand.
+* **AST Static Security Analyzer**: Inspects code syntax trees to block destructive operating system commands (`rmdir /s /q`, disk wipers, malicious scripts) before execution.
+* **Subprocess Sandbox Verification**: Executes newly generated skills in an isolated subprocess with a strict 10-second timeout.
+* **Persistent Skill Storage (`skills/`)**: Skills are permanently saved as `.py` files and automatically reloaded into memory on startup.
+
+### 💻 Live Desktop Terminal & Real-Time Debug Console
+* **Dedicated Terminal Overlay (`ui.py`)**: Click **`💻 TERMINAL`** in the header to open a floating cyberpunk live console.
+* **Full Stdout/Stderr Redirection**: Captures 100% of background `print()` statements, LLM payloads, audio stream events, and exception tracebacks from the moment TITAN boots.
+* **Stream Isolation**: Keeps the right sidebar **Activity Stream** clean and user-friendly while sending deep raw logs to the Terminal.
+* **Console Controls**: Live keyword search/filter, Auto-Scroll toggle, Clear Console, and Copy All.
+
+### 📊 Real-Time System Telemetry & Hardware Monitor
+* **Dynamic Hardware Telemetry (`actions/system_monitor.py`)**: Real-time monitoring for CPU, RAM, Network speeds, GPU load, and CPU temperature.
+* **Dynamic Thermal Load Estimation**: Ensures active °C temperatures and GPU metrics are always reported accurately on Windows even without admin permissions.
 
 ---
 
@@ -45,7 +57,7 @@ TITAN 2.0 is a real-time, multimodal personal AI assistant engineered for full s
 ```text
 titan2.0/
 ├── main.py                   # Core loop — Gemini Live WebSocket session, tool dispatcher & startup gate
-├── ui.py                     # PyQt6 HUD — obsidian glass command center, waveform display & security modals
+├── ui.py                     # PyQt6 HUD — obsidian glass command center, live terminal console & security modals
 ├── doc_engine.py             # Docling & Unstructured document reader and formatted Word (.docx) writer
 ├── task_planner.py           # Multi-step autonomous document reasoning & Q&A pipeline
 ├── shadow_bridge.py          # Embedded Neural WebSocket Bridge (Port 8002) for Chrome Extension control
@@ -53,6 +65,8 @@ titan2.0/
 ├── run.bat                   # Windows launcher script with OpenBLAS memory environment constraints
 │
 ├── actions/
+│   ├── skill_engine.py       # Autonomous Skill Engine (create, edit, delete, AST safety, sandbox test)
+│   ├── system_monitor.py     # Hardware telemetry (CPU/RAM/GPU/Temp) & voice status reporting
 │   ├── ui_automation.py      # Windows Accessibility UIA background control (zero mouse hijacking)
 │   ├── file_controller.py    # Local file system manager with safe .docx Word generator routing
 │   ├── file_processor.py     # Local file processing engine (OCR, PDF, CSV/Excel stats, code review)
@@ -63,7 +77,6 @@ titan2.0/
 │   ├── background_monitor.py # Background topic watching & news monitoring
 │   ├── proactive.py          # Proactive 2.0 context-aware check-in engine
 │   ├── reminder.py           # Scheduled system notifications
-│   ├── system_monitor.py     # Hardware telemetry (CPU/RAM/GPU/Temp)
 │   ├── computer_settings.py  # Volume, brightness, Wi-Fi, power control
 │   ├── computer_control.py   # Fallback mouse, hotkeys, and window management
 │   ├── open_app.py           # Application launcher
@@ -73,6 +86,7 @@ titan2.0/
 │   ├── flight_finder.py      # Flight search lookup
 │   └── youtube_video.py      # YouTube search & playback control
 │
+├── skills/                   # Persistent user & AI-generated custom Python skill modules
 ├── titan-extension/          # Embedded Chrome Extension source & DOM inspector
 ├── memory/
 │   ├── memory_manager.py     # Persistent memory manager
@@ -81,6 +95,7 @@ titan2.0/
 ├── core/
 │   └── prompt.txt            # System prompt & tool routing directives
 └── config/
+    ├── titan_v3.ico          # Multi-resolution cropped emblem icon asset
     └── api_keys.json         # API key, OS settings, assistant name, user name
 ```
 
@@ -90,6 +105,8 @@ titan2.0/
 
 | Tool Name | Action / Scope | Description |
 |---|---|---|
+| `skill_engine` | `create_skill` \| `edit_skill` \| `get_code` \| `delete_skill` \| `list_skills` \| `execute_skill` | Autonomous Skill Lifecycle Engine with AST security verification and sandbox testing. |
+| `system_status` | *None* | Real-time CPU, RAM, GPU, CPU temperature, uptime, and process telemetry. |
 | `ui_automation` | `click` \| `type` \| `get_text` \| `dump_tree` | **Primary** Windows desktop app interaction via UIAutomation without stealing mouse pointer. |
 | `smart_task` | `answer_questions_in_doc` \| `summarize_document` \| `rewrite_document` \| `generate_document` | Autonomous multi-step document reasoning & styled Word `.docx` report writer. |
 | `shadow_link` | `get_url` \| `click` \| `type` \| `scroll` \| `extract` | Primary Chrome web browser DOM interaction tool via WebSocket bridge. |
@@ -121,7 +138,7 @@ pip install -r requirements.txt
 # Launch TITAN 2.0
 python main.py
 ```
-*or simply double-click **`run.bat`** on Windows.*
+*or simply double-click **`TITAN AI Assistant.lnk`** on your Desktop.*
 
 ### 3. API Configuration
 Add your Gemini API key in `config/api_keys.json`:

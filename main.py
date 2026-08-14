@@ -61,6 +61,7 @@ from actions.computer_control  import computer_control
 from actions.game_updater      import game_updater
 from actions.shadow_link       import shadow_link_control
 from actions.system_monitor    import SystemMonitor, get_system_status
+from actions.skill_engine      import skill_engine
 from actions.proactive         import ProactiveEngine
 from actions.background_monitor import (
     add_monitor, remove_monitor, list_monitors, check_all as monitor_check_all,
@@ -200,6 +201,31 @@ TOOL_DECLARATIONS = [
         "parameters": {
             "type": "OBJECT",
             "properties": {},
+        }
+    },
+    {
+        "name": "skill_engine",
+        "description": (
+            "Autonomous Skill Lifecycle & Execution Engine. "
+            "Allows TITAN to dynamically write, edit, delete, inspect, test in sandbox, "
+            "and execute custom Python skills at runtime. "
+            "Actions: 'create_skill' (writes & verifies in sandbox), "
+            "'edit_skill' (updates existing skill & re-verifies in sandbox), "
+            "'delete_skill' (removes skill from disk & unloads from memory), "
+            "'get_code' (reads source code of saved skill), "
+            "'list_skills' (lists all saved skills), "
+            "'execute_skill' (runs a function inside a saved skill)."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "action": {"type": "STRING", "description": "create_skill | edit_skill | delete_skill | get_code | list_skills | execute_skill"},
+                "skill_name": {"type": "STRING", "description": "Name of the skill (e.g. 'crypto_tracker', 'pdf_invoice_parser')"},
+                "python_code": {"type": "STRING", "description": "Python code for create_skill or edit_skill"},
+                "function_name": {"type": "STRING", "description": "Name of function to run for execute_skill"},
+                "kwargs": {"type": "OBJECT", "description": "Arguments to pass to the function"}
+            },
+            "required": ["action"]
         }
     },
     {
@@ -1013,6 +1039,29 @@ class TitanLive:
             elif name == "system_status":
                 r = await loop.run_in_executor(None, get_system_status)
                 result = str(r)
+
+            elif name == "skill_engine":
+                action = args.get("action", "list_skills").strip()
+                s_name = args.get("skill_name", "").strip()
+                code   = args.get("python_code", "")
+
+                if action in ("create_skill", "edit_skill"):
+                    r = await loop.run_in_executor(None, lambda: skill_engine.create_and_test_skill(s_name or "custom_task", code))
+                    result = str(r)
+                elif action == "delete_skill":
+                    r = await loop.run_in_executor(None, lambda: skill_engine.delete_skill(s_name))
+                    result = str(r)
+                elif action == "get_code":
+                    r = await loop.run_in_executor(None, lambda: skill_engine.get_skill_code(s_name))
+                    result = str(r)
+                elif action == "execute_skill":
+                    f_name = args.get("function_name", "run")
+                    kw = args.get("kwargs", {})
+                    r = await loop.run_in_executor(None, lambda: skill_engine.execute_skill(s_name, f_name, **kw))
+                    result = str(r)
+                else:
+                    skills_list = skill_engine.list_skills()
+                    result = f"Available custom skills: {skills_list}" if skills_list else "No custom skills created yet."
 
             elif name == "manage_monitor":
                 action = args.get("action", "").lower().strip()
