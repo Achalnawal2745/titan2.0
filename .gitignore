@@ -22,16 +22,24 @@ wheels/
 .installed.cfg
 *.egg
 
-# ── TITAN Security & Personal Voice/Face Embeddings ─────────────────────────
-memory/owner_face.npy
-memory/owner_voice.npy
-memory/owner_voice_gmm.pkl
+# ── TITAN Security, Personal Memories & Biometric Embeddings ─────────────────
+memory/*.json
+memory/*.npy
+memory/*.pkl
+memory/*.bin
+!memory/config_manager.py
+!memory/memory_manager.py
+!memory/__init__.py
 
-# ── API Keys & Secrets ───────────────────────────────────────────────────────
-config/api_keys.json
+# ── API Keys, Certificates & Secrets ─────────────────────────────────────────
+config/*.json
+config/certs/
+!config/*.example.json
 .env
+.env.*
 *.pem
 *.key
+*.crt
 
 # ── Node & Chrome Extension Build Artifacts ────────────────────────────────
 node_modules/
@@ -43,13 +51,26 @@ titan-extension/node_modules/
 titan-extension/dist/
 titan-extension/.turbo/
 
-# ── Vault & Temporary Data ──────────────────────────────────────────────────
+# ── Local Databases, Vault & Temporary Uploads ──────────────────────────────
 shadow_vault/
 scratch/
+uploads/
+qdrant_db/
+*.db
+*.sqlite
+*.sqlite3
 *.log
 *.tmp
 .DS_Store
 Thumbs.db
+
+# ── User Media & Captured Screenshots/Audio ───────────────────────────────
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.wav
+*.mp3
 
 # ── IDEs & Editors ──────────────────────────────────────────────────────────
 .idea/
