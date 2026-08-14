@@ -95,14 +95,26 @@ def _get_api_key() -> str:
 
 
 def _load_system_prompt() -> str:
+    prompt_text = ""
     try:
-        return PROMPT_PATH.read_text(encoding="utf-8")
+        prompt_text = PROMPT_PATH.read_text(encoding="utf-8")
     except Exception:
-        return (
+        prompt_text = (
             "You are TITAN, an advanced AI assistant. "
             "Be concise, direct, and always use the provided tools to complete tasks. "
             "Never simulate or guess results — always call the appropriate tool."
         )
+    
+    try:
+        from actions.skill_engine import skill_engine
+        active_skills = skill_engine.list_skills()
+        if active_skills:
+            prompt_text += f"\n\nCURRENT ACTIVE CUSTOM SKILLS: {active_skills}\n"
+            prompt_text += "PROACTIVE SKILL RULE: When the user asks for any task matching an active skill, call skill_engine action='execute_skill' IMMEDIATELY and PROACTIVELY. Never ask the user 'should I use my skill' or say you cannot measure/do it — execute the skill autonomously on first mention!"
+    except Exception:
+        pass
+
+    return prompt_text
 
 _CTRL_RE = re.compile(r"<ctrl\d+>", re.IGNORECASE)
 
@@ -1012,7 +1024,7 @@ class TitanLive:
 
             elif name == "smart_task":
                 import task_planner
-                api_key = get_config().get("api_key", "")
+                api_key = _get_api_key()
                 r = await loop.run_in_executor(None, lambda: task_planner.run_smart_task(args, api_key))
                 result = r or "Done."
 
@@ -1055,8 +1067,13 @@ class TitanLive:
                     r = await loop.run_in_executor(None, lambda: skill_engine.get_skill_code(s_name))
                     result = str(r)
                 elif action == "execute_skill":
-                    f_name = args.get("function_name", "run")
+                    f_name = args.get("function_name", "")
                     kw = args.get("kwargs", {})
+                    if not isinstance(kw, dict):
+                        kw = {}
+                    for k, v in args.items():
+                        if k not in ("action", "skill_name", "function_name", "kwargs", "name"):
+                            kw.setdefault(k, v)
                     r = await loop.run_in_executor(None, lambda: skill_engine.execute_skill(s_name, f_name, **kw))
                     result = str(r)
                 else:

@@ -387,7 +387,11 @@ def take_screenshot():
 
 def lock_screen():
     if _OS == "Windows":
-        pyautogui.hotkey("win", "l")
+        try:
+            import ctypes
+            ctypes.windll.user32.LockWorkStation()
+        except Exception:
+            subprocess.run(["rundll32.exe", "user32.dll,LockWorkStation"], capture_output=True)
     elif _OS == "Darwin":
         subprocess.run(["pmset", "displaysleepnow"], capture_output=True)
     else:

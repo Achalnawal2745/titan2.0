@@ -513,6 +513,11 @@ def computer_control(
                 print(f"[ComputerControl] ⚠️ No '{field}' in memory, using random: {value}")
             return value
 
+        if action == "lock_screen":
+            from actions.computer_settings import lock_screen
+            lock_screen()
+            return "Screen locked."
+
         return f"Unknown action: '{action}'"
 
     except Exception as e:

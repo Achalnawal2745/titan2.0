@@ -2064,6 +2064,27 @@ class _TerminalStdoutRedirector:
             except Exception:
                 pass
 
+    def isatty(self):
+        if self._orig and hasattr(self._orig, "isatty"):
+            try:
+                return self._orig.isatty()
+            except Exception:
+                pass
+        return False
+
+    def fileno(self):
+        if self._orig and hasattr(self._orig, "fileno"):
+            try:
+                return self._orig.fileno()
+            except Exception:
+                pass
+        raise io.UnsupportedOperation("fileno")
+
+    def __getattr__(self, name):
+        if self._orig and hasattr(self._orig, name):
+            return getattr(self._orig, name)
+        raise AttributeError(f"'_TerminalStdoutRedirector' object has no attribute '{name}'")
+
 
 class TerminalOverlay(QWidget):
     """Floating cyberpunk terminal overlay displaying live system, command, and AI debug logs."""

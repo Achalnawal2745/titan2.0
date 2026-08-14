@@ -123,28 +123,81 @@ def shadow_link_control(parameters: dict = None) -> str:
             except RuntimeError:
                 st_res = asyncio.run(_send_chrome_command("get_state", {}))
 
-            if isinstance(st_res, dict) and "elementTree" in st_res:
-                elems = st_res["elementTree"].get("clickableElements", [])
+            if isinstance(st_res, dict):
                 q = (params.get("description") or params.get("text") or params.get("selector") or "").lower()
                 q_clean = q.replace("login", "log in").replace("button", "").strip()
+                q_words = set(q_clean.split())
                 
                 matched_idx = None
-                if q_clean:
-                    for el in elems:
-                        txt = (el.get("text") or el.get("attributes", {}).get("text") or el.get("attributes", {}).get("value") or "").lower()
-                        if q_clean and (q_clean in txt or txt in q_clean or "email" in txt or "inbox" in txt):
+                best_score = 0
+                all_found_indices = []
+
+                # Format A: interactive_elements string (standard Chrome extension output)
+                raw_tree_str = st_res.get("interactive_elements", "")
+                if isinstance(raw_tree_str, str) and raw_tree_str:
+                    import re
+                    # Matches [0]<a class='...'> Go or *[0]<button>...
+                    line_matches = re.findall(r"(?:\*?\[(\d+)\])(.*?)(?=\n|\r|$)", raw_tree_str)
+                    for idx_str, content_str in line_matches:
+                        try:
+                            idx = int(idx_str)
+                            all_found_indices.append(idx)
+                            c_lower = content_str.lower()
+
+                            # Exact or high match
+                            if q_clean and (q_clean in c_lower or c_lower in q_clean):
+                                matched_idx = idx
+                                best_score = 999
+                                break
+
+                            # Keyword scoring
+                            score = sum(1 for w in q_words if w in c_lower)
+                            if score > best_score:
+                                best_score = score
+                                matched_idx = idx
+                        except ValueError:
+                            continue
+
+                # Format B: raw elementTree dict
+                elif "elementTree" in st_res:
+                    elems = st_res["elementTree"].get("clickableElements", [])
+                    if q_clean:
+                        for el in elems:
+                            attrs = el.get("attributes", {})
+                            parts = [
+                                el.get("text", ""),
+                                attrs.get("text", ""),
+                                attrs.get("value", ""),
+                                attrs.get("aria-label", ""),
+                                attrs.get("title", ""),
+                                attrs.get("class", ""),
+                                attrs.get("id", ""),
+                                attrs.get("name", ""),
+                                attrs.get("alt", ""),
+                                el.get("tagName", ""),
+                            ]
+                            combined_txt = " ".join(str(p) for p in parts if p).lower()
                             idx_found = el.get("highlightIndex")
-                            if idx_found is not None:
+                            if idx_found is None:
+                                continue
+                            all_found_indices.append(idx_found)
+
+                            if q_clean in combined_txt or combined_txt in q_clean:
                                 matched_idx = idx_found
                                 break
 
-                # Fallback: if no text match, use first clickable element index
-                if matched_idx is None and elems:
-                    matched_idx = elems[0].get("highlightIndex", 0)
+                            score = sum(1 for w in q_words if w in combined_txt)
+                            if score > best_score:
+                                best_score = score
+                                matched_idx = idx_found
+
+                # Fallback: if no text matched, use first interactive index
+                if matched_idx is None and all_found_indices:
+                    matched_idx = all_found_indices[0]
 
                 if matched_idx is not None:
                     params["index"] = matched_idx
-                    print(f"[ShadowLink AutoIndex] Resolved index={matched_idx} for query='{q}'")
+                    print(f"[ShadowLink AutoIndex] Resolved index={matched_idx} for query='{q}' (score={best_score})")
         except Exception as e:
             print(f"[ShadowLink AutoIndex Error] {e}")
 
