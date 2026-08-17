@@ -9,6 +9,20 @@ import warnings
 os.environ["QT_LOGGING_RULES"] = "*.debug=false;qt.qpa.*=false;qt.text.*=false;qt.qpa.window=false"
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
+try:
+    import colorama
+    colorama.just_fix_windows_console()
+except Exception:
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        hStdOut = kernel32.GetStdHandle(-11)
+        mode = ctypes.c_ulong()
+        kernel32.GetConsoleMode(hStdOut, ctypes.byref(mode))
+        kernel32.SetConsoleMode(hStdOut, mode.value | 0x0004)
+    except Exception:
+        pass
+
 # ── Nuclear: force CREATE_NO_WINDOW on EVERY subprocess call on Windows ───────
 # This patches Popen itself, so no per-file flag is needed anywhere.
 if _platform.system() == "Windows":
@@ -147,20 +161,26 @@ TOOL_DECLARATIONS = [
     {
         "name": "smart_task",
         "description": (
-            "Autonomous multi-step reasoning task pipeline for documents. "
-            "Actions: 'answer_questions_in_doc' (extracts & answers questions into Word doc), "
+            "Autonomous multi-step document & presentation intelligence pipeline. "
+            "Actions: 'generate_document' (writes an executive Word .docx report with tables & callouts), "
+            "'generate_presentation' (writes a 16:9 Widescreen PowerPoint .pptx deck with cards & KPI metrics), "
+            "'generate_interactive_deck' (creates an animated HTML5 browser presentation), "
+            "'fill_template' (fills an existing Word .docx template with new data while preserving layouts & logos), "
+            "'answer_questions_in_doc' (extracts & answers questions into Word doc), "
             "'summarize_document' (summarizes file into Word doc), "
-            "'rewrite_document' (transforms/translates file into Word doc), "
-            "'generate_document' (writes full document on topic into Word doc)."
+            "'rewrite_document' (transforms/translates file into Word doc)."
         ),
         "parameters": {
             "type": "OBJECT",
             "properties": {
-                "action": {"type": "STRING", "description": "answer_questions_in_doc | summarize_document | rewrite_document | generate_document"},
-                "source_path": {"type": "STRING", "description": "Input document path (.pdf, .docx, .txt)"},
-                "output_path": {"type": "STRING", "description": "Output .docx file path"},
-                "topic": {"type": "STRING", "description": "Topic for document generation"},
-                "instruction": {"type": "STRING", "description": "Instruction for rewrite/transformation"}
+                "action": {"type": "STRING", "description": "generate_document | generate_presentation | generate_interactive_deck | fill_template | answer_questions_in_doc | summarize_document | rewrite_document"},
+                "topic": {"type": "STRING", "description": "Topic for document or presentation generation"},
+                "output_path": {"type": "STRING", "description": "Output file path (.docx, .pptx, or .html)"},
+                "source_path": {"type": "STRING", "description": "Input document or template path (.docx, .pdf, .txt)"},
+                "image_path": {"type": "STRING", "description": "Optional image on Desktop, Downloads, or disk to embed into Word doc or PPTX"},
+                "num_slides": {"type": "INTEGER", "description": "Number of slides for presentation (default 5)"},
+                "theme": {"type": "STRING", "description": "Visual theme: 'navy' | 'executive' | 'midnight' | 'crimson' | 'emerald'"},
+                "instruction": {"type": "STRING", "description": "Instruction for template fill, rewrite, or custom formatting"}
             },
             "required": ["action"]
         }
@@ -759,9 +779,11 @@ class TitanLive:
             self.ui.set_state("LISTENING")
 
     def interrupt(self) -> None:
-        """Stop TITAN mid-speech: drain queued audio, notify server to discard turn, and reset mic buffer."""
-        self._interrupted = True
-        # Clear incoming AI audio queue
+        """Stop TITAN mid-speech: drain queued audio playback immediately."""
+        with self._speaking_lock:
+            self._is_speaking = False
+
+        # Clear incoming AI audio queue immediately so speaker stops
         q = self.audio_in_queue
         if q:
             drained = 0
@@ -774,38 +796,14 @@ class TitanLive:
             if drained:
                 print(f"[TITAN] ✋ Interrupted — {drained} audio chunks discarded")
 
-        # Clear outgoing mic queue to discard pre-interrupt recorded audio
-        if self.out_queue:
-            while not self.out_queue.empty():
-                try:
-                    self.out_queue.get_nowait()
-                except Exception:
-                    break
-
-        # Clear rolling voice gate buffer to discard buffered pre-interrupt speech
-        try:
-            from actions.voice_face_id import clear_voice_gate_buffer
-            clear_voice_gate_buffer()
-        except Exception:
-            pass
-
-        # Send turn interruption signal to Gemini Live server
-        if self._loop and self.session:
-            async def _send_cancel():
-                try:
-                    from google.genai import types as _gtypes
-                    await self.session.send_client_content(
-                        turns=_gtypes.Content(role="user", parts=[_gtypes.Part.from_text(text="[INTERRUPT: Discard previous command]")]),
-                        turn_complete=True
-                    )
-                except Exception as e:
-                    print(f"[TITAN] Server interrupt error: {e}")
-            asyncio.run_coroutine_threadsafe(_send_cancel(), self._loop)
-
-        self.set_speaking(False)
         if self._turn_done_event:
             self._turn_done_event.clear()
-        self.ui.write_log("SYS: Interrupted — listening...")
+
+        if self.ui and not self.ui.muted:
+            try:
+                self.ui.set_state("LISTENING")
+            except Exception:
+                pass
 
     def speak(self, text: str):
         if not self._loop or not self.session:
@@ -1147,10 +1145,22 @@ class TitanLive:
         loop = asyncio.get_event_loop()
 
         def callback(indata, frames, time_info, status):
-            with self._speaking_lock:
-                titan_speaking = self._is_speaking
-            if not titan_speaking and not self.ui.muted and not self._phone_active:
+            if not self.ui.muted and not self._phone_active:
                 data = indata.tobytes()
+                with self._speaking_lock:
+                    titan_speaking = self._is_speaking
+                
+                # If TITAN is speaking, only send when there is clear voice energy to avoid speaker loop
+                if titan_speaking:
+                    try:
+                        import numpy as np
+                        arr = np.frombuffer(data, dtype=np.int16)
+                        rms = float(np.sqrt(np.mean(arr.astype(np.float32)**2)))
+                        if rms < 900.0:  # Ignore low ambient speaker bleed
+                            return
+                    except Exception:
+                        pass
+
                 if verify_voice(data):
                     loop.call_soon_threadsafe(
                         self.out_queue.put_nowait,
@@ -1181,20 +1191,22 @@ class TitanLive:
                 async for response in self.session.receive():
 
                     if response.data:
-                        if self._interrupted:
-                            pass  # discard: interrupted
-                        else:
-                            if self._turn_done_event and self._turn_done_event.is_set():
-                                self._turn_done_event.clear()
-                            # Split into ~50 ms chunks so interrupt() stops audio within 50 ms
-                            # (24000 Hz × 2 bytes/sample × 0.05 s = 2400 bytes per slice)
-                            _audio_data = response.data
-                            _SLICE = 2400
-                            for _i in range(0, len(_audio_data), _SLICE):
-                                self.audio_in_queue.put_nowait(_audio_data[_i : _i + _SLICE])
+                        if self._turn_done_event and self._turn_done_event.is_set():
+                            self._turn_done_event.clear()
+                        # Split into ~50 ms chunks so interrupt() stops audio within 50 ms
+                        # (24000 Hz × 2 bytes/sample × 0.05 s = 2400 bytes per slice)
+                        _audio_data = response.data
+                        _SLICE = 2400
+                        for _i in range(0, len(_audio_data), _SLICE):
+                            self.audio_in_queue.put_nowait(_audio_data[_i : _i + _SLICE])
 
                     if response.server_content:
                         sc = response.server_content
+
+                        # Server-side Gemini Live barge-in signal
+                        if getattr(sc, "interrupted", False):
+                            print("[TITAN] ✋ Gemini Live detected user barge-in — stopping speech")
+                            self.interrupt()
 
                         if sc.output_transcription and sc.output_transcription.text:
                             txt = _clean_transcript(sc.output_transcription.text)
@@ -1204,23 +1216,17 @@ class TitanLive:
                         if sc.input_transcription and sc.input_transcription.text:
                             txt = _clean_transcript(sc.input_transcription.text)
                             if txt:
-                                if self._interrupted:
-                                    self._interrupted = False
-                                    out_buf = []
+                                with self._speaking_lock:
+                                    is_spk = self._is_speaking
+                                if is_spk:
+                                    print(f"[TITAN] ✋ User spoke: '{txt}' — stopping playback (barge-in)")
+                                    self.interrupt()
                                 in_buf.append(txt)
                                 self._last_user_speech = time.monotonic()
 
                         if sc.turn_complete:
                             if self._turn_done_event:
                                 self._turn_done_event.set()
-
-                            full_in = " ".join(in_buf).strip()
-                            if self._interrupted:
-                                self._interrupted = False
-                                out_buf = []
-                                if not full_in:
-                                    in_buf = []
-                                    continue
 
                             full_in = " ".join(in_buf).strip()
                             if full_in:
@@ -1315,6 +1321,10 @@ class TitanLive:
                     ):
                         self.set_speaking(False)
                         self._turn_done_event.clear()
+                    continue
+
+                if self._interrupted:
+                    self.set_speaking(False)
                     continue
 
                 self.set_speaking(True)

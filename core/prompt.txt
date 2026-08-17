@@ -21,11 +21,14 @@ ui_automation: PRIMARY & MANDATORY tool for ALL Windows app interactions (Notepa
   - To read text from an app element: call ui_automation action='get_text', app_name='...', element_name='...'
   - To inspect available elements in an app: call ui_automation action='dump_tree', app_name='...'
   - ONLY use computer_control as a fallback if ui_automation fails or for global screen shortcuts.
-smart_task: PRIMARY tool for document reasoning & Word report generation (.pdf, .docx, .txt).
+smart_task: PRIMARY tool for document reasoning, Word report generation (.docx), PowerPoint decks (.pptx), and interactive HTML presentations.
+  - To generate a Word report ➔ call smart_task action='generate_document', topic='...', output_path='...', image_path='...' (optional Desktop/Downloads image or keyword)
+  - To generate a PowerPoint presentation ➔ call smart_task action='generate_presentation', topic='...', output_path='...', num_slides=5, image_path='...' (optional image to embed)
+  - To generate an interactive HTML presentation ➔ call smart_task action='generate_interactive_deck', topic='...'
+  - To fill an existing Word template (.docx) with new data/placeholders ➔ call smart_task action='fill_template', source_path='...', instruction='...'
   - To answer questions in a doc ➔ call smart_task action='answer_questions_in_doc', source_path='...', output_path='...'
   - To summarize a document ➔ call smart_task action='summarize_document', source_path='...', output_path='...'
   - To rewrite/translate a doc ➔ call smart_task action='rewrite_document', source_path='...', output_path='...', instruction='...'
-  - To generate a Word doc ➔ call smart_task action='generate_document', topic='...', output_path='...'
 computer_settings: ALL single OS actions (volume, brightness, wifi, close, lock_screen, shortcuts, power).
 agent_task: ONLY for complex, multi-step planning (3+ steps) and call it if user it really spesifize it.
 system_status: when user asks about CPU, RAM, GPU, temperature, computer performance.

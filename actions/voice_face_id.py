@@ -55,7 +55,7 @@ def _default_config() -> dict:
         "face_enrolled": False,
         "pin_hash": "",
         "voice_threshold": 0.65,
-        "face_threshold": 0.25,
+        "face_threshold": 0.38,
     }
 
 def set_master_security_lock(enable: bool) -> dict:
@@ -233,18 +233,24 @@ def _verify_voice_sample(pcm_data: bytes) -> bool:
         return False
 
 
-# ── FACE FEATURE EXTRACTION (YuNet DNN — OpenCV 5.0) ────────────────────────
+# ── FACE FEATURE EXTRACTION (YuNet Detector + SFace Deep Biometric Recognizer) ──
 YUNET_MODEL = MEMORY_DIR / "face_detection_yunet.onnx"
+SFACE_MODEL = MEMORY_DIR / "face_recognition_sface.onnx"
 
 def _get_face_detector(w: int, h: int):
     """Create YuNet face detector for given image dimensions."""
-    model_path = str(YUNET_MODEL)
     if not YUNET_MODEL.exists():
         return None
-    return cv2.FaceDetectorYN.create(model_path, "", (w, h), 0.6, 0.3, 5000)
+    return cv2.FaceDetectorYN.create(str(YUNET_MODEL), "", (w, h), 0.6, 0.3, 5000)
+
+def _get_face_recognizer():
+    """Create SFace deep neural network face recognizer."""
+    if not SFACE_MODEL.exists():
+        return None
+    return cv2.FaceRecognizerSF.create(str(SFACE_MODEL), "")
 
 def extract_face_embedding(image_bytes: bytes) -> np.ndarray | None:
-    """Extract 128-dim facial embedding from image bytes using YuNet DNN."""
+    """Extract 128-dim deep biometric facial embedding using SFace DNN."""
     if not _CV2_AVAILABLE or not image_bytes:
         return None
     try:
@@ -264,20 +270,25 @@ def extract_face_embedding(image_bytes: bytes) -> np.ndarray | None:
             print("[FaceID] No face detected in frame.")
             return None
 
-        # Extract face ROI from first detected face
         face = faces[0]
+
+        # Use SFace Deep Biometric Recognizer if available
+        recognizer = _get_face_recognizer()
+        if recognizer is not None:
+            aligned_face = recognizer.alignCrop(img, face)
+            feat = recognizer.feature(aligned_face).flatten()
+            norm = np.linalg.norm(feat)
+            return feat / norm if norm > 0 else None
+
+        # Fallback to aligned spatial descriptor
         x, y, fw, fh = int(face[0]), int(face[1]), int(face[2]), int(face[3])
-        # Clamp to image bounds
         x, y = max(0, x), max(0, y)
-        fw = min(fw, w - x)
-        fh = min(fh, h - y)
+        fw, fh = min(fw, w - x), min(fh, h - y)
         if fw < 10 or fh < 10:
             return None
 
         face_roi = cv2.cvtColor(img[y:y+fh, x:x+fw], cv2.COLOR_BGR2GRAY)
         face_roi = cv2.resize(face_roi, (128, 128))
-
-        # Normalized histogram embedding
         hist, _ = np.histogram(face_roi, bins=128, range=(0, 256))
         feat = hist.astype(np.float32)
         norm = np.linalg.norm(feat)

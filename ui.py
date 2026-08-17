@@ -2378,6 +2378,10 @@ class MainWindow(QMainWindow):
 
         self._terminal_overlay = TerminalOverlay(central)
         self._terminal_overlay.hide()
+
+        # Global ESC Shortcut: Instant Interrupt / Stop Speech / Reset Listening
+        self._esc_shortcut = QShortcut(QKeySequence(Qt.Key.Key_Escape), self)
+        self._esc_shortcut.activated.connect(self._do_interrupt)
         self._terminal_sig.connect(self._terminal_overlay.append_log)
 
         # Pipe raw stdout & stderr ONLY to Terminal Console (keeping Activity Stream clean)

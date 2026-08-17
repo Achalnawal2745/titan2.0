@@ -1,6 +1,7 @@
 import speedtest
 import urllib.request
 import time
+import io # Explicitly import io
 
 def run():
     """
@@ -25,4 +26,4 @@ def run():
             return f"Speed test error: {e}"
 
 def execute():
-    return run()
+    return run()
