@@ -93,6 +93,7 @@ export default class BrowserContext {
   public async getCurrentPage(): Promise<Page> {
     // 1. If _currentTabId not set, query the active tab and attach it
     if (!this._currentTabId) {
+      let activeTab: chrome.tabs.Tab;
       let [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
       if (!tab?.id) {
         [tab] = await chrome.tabs.query({ active: true });

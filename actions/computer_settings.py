@@ -172,9 +172,38 @@ def brightness_down():
         except Exception as e:
             print(f"[Settings] Brightness down failed on Windows: {e}")
 
-def close_app():
+def close_app(app_name: str = None):
+    if app_name and _OS == "Windows":
+        clean_name = app_name.strip().lower().replace(".exe", "")
+        # Common process names mapping
+        proc_map = {
+            "calculator": "CalculatorApp.exe",
+            "calc": "CalculatorApp.exe",
+            "notepad": "notepad.exe",
+            "chrome": "chrome.exe",
+            "edge": "msedge.exe",
+            "spotify": "Spotify.exe",
+            "word": "WINWORD.EXE",
+            "excel": "EXCEL.EXE",
+            "powerpoint": "POWERPNT.EXE",
+            "vlc": "vlc.exe",
+            "cmd": "cmd.exe",
+            "terminal": "WindowsTerminal.exe",
+            "discord": "Discord.exe",
+            "telegram": "Telegram.exe",
+            "whatsapp": "WhatsApp.exe",
+        }
+        target_exe = proc_map.get(clean_name, f"{clean_name}.exe")
+        try:
+            res = subprocess.run(["taskkill", "/IM", target_exe, "/F"], capture_output=True, text=True, **_WIN_HIDE)
+            if res.returncode == 0:
+                return True
+        except Exception:
+            pass
+
     if _OS == "Darwin": pyautogui.hotkey("command", "q")
     else:               pyautogui.hotkey("alt", "f4")
+    return True
 
 def close_window():
     if _OS == "Darwin": pyautogui.hotkey("command", "w")
@@ -536,7 +565,11 @@ ACTION_MAP: dict[str, callable] = {
     "screen_off":          sleep_display,
     "pause_video":         pause_video,
     "play_pause":          pause_video,
+    "close":               close_app,
     "close_app":           close_app,
+    "exit":                close_app,
+    "quit":                close_app,
+    "kill":                close_app,
     "close_window":        close_window,
     "full_screen":         full_screen,
     "fullscreen":          full_screen,
@@ -697,6 +730,16 @@ def computer_settings(
     if action == "scroll_down":
         scroll_down(int(value or 500))
         return "Scrolled down."
+
+    if action in ("close", "close_app", "exit", "quit", "kill"):
+        app_name = str(value or params.get("app_name", "")).strip()
+        if not app_name and description:
+            # Try to extract app name from description like "Close Calculator"
+            m = re.search(r"(?:close|exit|quit|kill)\s+([a-zA-Z0-9_\-\s]+)", description, re.IGNORECASE)
+            if m:
+                app_name = m.group(1).strip()
+        close_app(app_name if app_name else None)
+        return f"Closed {app_name if app_name else 'application'}."
 
     func = ACTION_MAP.get(action)
     if not func:

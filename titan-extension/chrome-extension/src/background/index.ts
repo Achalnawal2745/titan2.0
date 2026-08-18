@@ -27,16 +27,52 @@ let currentPort: chrome.runtime.Port | null = null;
 const SIDE_PANEL_URL = chrome.runtime.getURL('side-panel/index.html');
 
 // --- SHADOW-LINK PC BRIDGE ---
+function notifySidePanel(data: any) {
+  try {
+    if (currentPort) {
+      currentPort.postMessage(data);
+    }
+  } catch {
+    // ignore
+  }
+}
+
+let pingIntervalId: any = null;
+
 function connectToShadowPC() {
-    const ws = new WebSocket('ws://localhost:8002');
+    if (pingIntervalId) {
+        clearInterval(pingIntervalId);
+        pingIntervalId = null;
+    }
+
+    const ws = new WebSocket('ws://127.0.0.1:8002');
     
     ws.onopen = () => {
         logger.info('🛰️ Connected to Shadow-PC Master Brain');
+        notifySidePanel({ type: 'bridge_event', status: 'connected', text: '🛰️ Connected to TITAN Master Brain (ws://127.0.0.1:8002)' });
+        
+        // Keepalive heartbeat every 10s to prevent MV3 worker sleep
+        pingIntervalId = setInterval(() => {
+            if (ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ type: 'ping' }));
+            }
+        }, 10000);
     };
 
     ws.onmessage = async (event) => {
-        const message = JSON.parse(event.data);
+        let message: any;
+        try {
+            message = JSON.parse(event.data);
+        } catch {
+            return;
+        }
+
+        if (message.type === 'pong' || message.type === 'ping') {
+            return;
+        }
+
         logger.info('📥 Received Remote Task:', message);
+        notifySidePanel({ type: 'bridge_event', status: 'cmd_received', text: `📥 [RECV] ${message.action || message.type || 'task'} ${JSON.stringify(message.url || message.text || message.task || '')}` });
 
         if (message.type === 'action') {
             try {
@@ -49,12 +85,43 @@ function connectToShadowPC() {
                         state: 'ERROR',
                         msg: 'No active page context found'
                     }));
+                    notifySidePanel({ type: 'bridge_event', status: 'cmd_error', text: '❌ No active page context found' });
                     return;
                 }
 
                 let resultMsg = '';
 
                 switch (action) {
+                    case 'get_url': {
+                        const browserState = await browserContext.getState(false);
+                        ws.send(JSON.stringify({
+                            id: message.id,
+                            state: 'COMPLETE',
+                            result: {
+                                url: browserState.url,
+                                title: browserState.title
+                            }
+                        }));
+                        notifySidePanel({ type: 'bridge_event', status: 'cmd_done', text: `📤 [URL] "${browserState.title}" (${browserState.url})` });
+                        return;
+                    }
+                    case 'extract': {
+                        const browserState = await browserContext.getState(true);
+                        const elementsText = browserState.elementTree.clickableElementsToString(
+                            DEFAULT_AGENT_OPTIONS.includeAttributes
+                        );
+                        ws.send(JSON.stringify({
+                            id: message.id,
+                            state: 'COMPLETE',
+                            result: {
+                                url: browserState.url,
+                                title: browserState.title,
+                                text: elementsText
+                            }
+                        }));
+                        notifySidePanel({ type: 'bridge_event', status: 'cmd_done', text: `📤 [EXTRACT] Extracted content from "${browserState.title}"` });
+                        return;
+                    }
                     case 'navigate': {
                         if (!message.url) throw new Error('url is required');
                         await browserContext.navigateTo(message.url);
@@ -76,6 +143,7 @@ function connectToShadowPC() {
                                 tabs: browserState.tabs
                             }
                         }));
+                        notifySidePanel({ type: 'bridge_event', status: 'cmd_done', text: `📤 [STATE] Extracted DOM tree for "${browserState.title}" (${browserState.url})` });
                         return;
                     }
                     case 'click': {
@@ -93,7 +161,7 @@ function connectToShadowPC() {
                         const elementNode = page.getDomElementByIndex(message.index);
                         if (!elementNode) throw new Error(`Element at index ${message.index} not found. Run get_state first.`);
                         await page.inputTextElementNode(false, elementNode, message.text);
-                        resultMsg = `Typed into element at index ${message.index}`;
+                        resultMsg = `Typed "${message.text}" into element [${message.index}]`;
                         break;
                     }
                     case 'back': {
@@ -137,6 +205,7 @@ function connectToShadowPC() {
                             state: 'COMPLETE',
                             result: { options }
                         }));
+                        notifySidePanel({ type: 'bridge_event', status: 'cmd_done', text: `📤 [DROPDOWN] Retrieved ${options?.length || 0} options` });
                         return;
                     }
                     case 'select_dropdown': {
@@ -160,6 +229,7 @@ function connectToShadowPC() {
                             state: 'COMPLETE',
                             result: { screenshot }
                         }));
+                        notifySidePanel({ type: 'bridge_event', status: 'cmd_done', text: '📤 [SCREENSHOT] Captured full tab screenshot' });
                         return;
                     }
                     case 'open_tab': {
@@ -194,40 +264,55 @@ function connectToShadowPC() {
                     state: 'COMPLETE',
                     result: { msg: resultMsg }
                 }));
+                notifySidePanel({ type: 'bridge_event', status: 'cmd_done', text: `📤 [DONE] ${resultMsg}` });
 
             } catch (error: any) {
+                const errMsg = error.message || 'Unknown error';
                 ws.send(JSON.stringify({
                     id: message.id,
                     state: 'ERROR',
-                    msg: error.message || 'Unknown error'
+                    msg: errMsg
                 }));
+                notifySidePanel({ type: 'bridge_event', status: 'cmd_error', text: `❌ [ERROR] ${errMsg}` });
             }
         } else if (message.type === 'new_task') {
             const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
             if (!tab || !tab.id) {
                 ws.send(JSON.stringify({state: 'ERROR', msg: 'No active tab found'}));
+                notifySidePanel({ type: 'bridge_event', status: 'cmd_error', text: '❌ No active tab found for task' });
                 return;
             }
 
             try {
+                notifySidePanel({ type: 'bridge_event', status: 'task_started', text: `⚡ [TASK START] ${message.task}` });
                 currentExecutor = await setupExecutor(message.taskId, message.task, browserContext);
                 subscribeToExecutorEvents(currentExecutor);
                 
                 currentExecutor.subscribeExecutionEvents(async event => {
                     ws.send(JSON.stringify(event));
+                    if (event.data?.details) {
+                        notifySidePanel({ type: 'bridge_event', status: 'agent_step', text: `🤖 [${event.actor}] ${event.data.details}` });
+                    }
                 });
 
                 const result = await currentExecutor.execute();
                 ws.send(JSON.stringify({state: 'COMPLETE', result}));
+                notifySidePanel({ type: 'bridge_event', status: 'task_done', text: '✅ [TASK COMPLETE] Finished autonomous execution.' });
             } catch (error: any) {
                 ws.send(JSON.stringify({state: 'ERROR', msg: error.message}));
+                notifySidePanel({ type: 'bridge_event', status: 'cmd_error', text: `❌ [TASK FAILED] ${error.message}` });
             }
         }
     };
 
     ws.onclose = () => {
-        logger.warning('⚠️ Shadow-PC Connection Lost. Retrying in 5s...');
-        setTimeout(connectToShadowPC, 5000);
+        if (pingIntervalId) {
+            clearInterval(pingIntervalId);
+            pingIntervalId = null;
+        }
+        logger.warning('⚠️ Shadow-PC Connection Lost. Retrying in 2s...');
+        notifySidePanel({ type: 'bridge_event', status: 'disconnected', text: '⚠️ Disconnected from TITAN Master Brain. Retrying in 2s...' });
+        setTimeout(connectToShadowPC, 2000);
     };
 }
 

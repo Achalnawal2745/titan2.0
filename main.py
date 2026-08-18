@@ -44,6 +44,7 @@ import time
 import json
 import sys
 import traceback
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 
@@ -97,11 +98,47 @@ def get_base_dir():
 BASE_DIR        = get_base_dir()
 API_CONFIG_PATH = BASE_DIR / "config" / "api_keys.json"
 PROMPT_PATH     = BASE_DIR / "core" / "prompt.txt"
-LIVE_MODEL          = "models/gemini-2.5-flash-native-audio-preview-12-2025"
+LIVE_MODELS = [
+    "models/gemini-2.5-flash-native-audio-preview-12-2025",
+    "models/gemini-3.1-flash-live-preview",
+    "models/gemini-2.0-flash-live-001",
+]
+_live_model_idx = 0
+
+def _get_live_model() -> str:
+    global _live_model_idx
+    return LIVE_MODELS[_live_model_idx % len(LIVE_MODELS)]
+
+def _rotate_live_model() -> str:
+    global _live_model_idx
+    _live_model_idx += 1
+    m = LIVE_MODELS[_live_model_idx % len(LIVE_MODELS)]
+    print(f"[TITAN] 🔄 Switching to model: {m}")
+    return m
+
 CHANNELS            = 1
 SEND_SAMPLE_RATE    = 16000
 RECEIVE_SAMPLE_RATE = 24000
-CHUNK_SIZE          = 1024
+CHUNK_SIZE          = 512     # 32 ms @ 16 kHz  (was 1024 = 64 ms)
+
+# ── Debug toggle: set True to see VAD / first-audio timings ──
+_DEBUG_AUDIO = False          # was True — per-chunk prints stall the event loop
+_dbg_chunk_count = 0
+
+# Local VAD — stream speech only, then tell Gemini "user stopped"
+_VAD_START_RMS      = 420.0   # start of a user utterance
+_VAD_HOLD_RMS       = 260.0   # stay in-speech (hysteresis)
+_VAD_PREROLL        = 6       # ~192 ms kept BEFORE speech so first word isn't clipped
+_VAD_END_SILENCE    = 14      # ~448 ms of quiet → end of turn
+_SEND_QUEUE_MAX     = 16      # ~0.5 s max buffer  (was 200 = 12.8 s of lag)
+_ECHO_TAIL_S        = 0.25    # ignore mic this long after Titan stops talking
+_AUDIO_MIME         = "audio/pcm;rate=16000"
+
+def _dbg(tag: str, msg: str):
+    if _DEBUG_AUDIO:
+        from datetime import datetime
+        ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        print(f"[{ts}] [{tag}] {msg}")
 
 def _get_api_key() -> str:
     with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
@@ -127,6 +164,15 @@ def _load_system_prompt() -> str:
             prompt_text += "PROACTIVE SKILL RULE: When the user asks for any task matching an active skill, call skill_engine action='execute_skill' IMMEDIATELY and PROACTIVELY. Never ask the user 'should I use my skill' or say you cannot measure/do it — execute the skill autonomously on first mention!"
     except Exception:
         pass
+
+    prompt_text += (
+        "\n\nREASONING RULE: You respond fast and directly for normal conversation and tool calls — "
+        "do not overthink simple requests. But if the user asks for something that genuinely needs "
+        "multi-step planning, comparison, or reasoning through constraints (e.g. scheduling, strategy, "
+        "complex decisions, multi-part math), call the deep_think tool instead of answering off the cuff. "
+        "Briefly tell the user you're thinking it through first, then call deep_think and speak its result "
+        "naturally in your own voice — don't read it robotically."
+    )
 
     return prompt_text
 
@@ -161,14 +207,9 @@ TOOL_DECLARATIONS = [
     {
         "name": "smart_task",
         "description": (
-            "Autonomous multi-step document & presentation intelligence pipeline. "
-            "Actions: 'generate_document' (writes an executive Word .docx report with tables & callouts), "
-            "'generate_presentation' (writes a 16:9 Widescreen PowerPoint .pptx deck with cards & KPI metrics), "
-            "'generate_interactive_deck' (creates an animated HTML5 browser presentation), "
-            "'fill_template' (fills an existing Word .docx template with new data while preserving layouts & logos), "
-            "'answer_questions_in_doc' (extracts & answers questions into Word doc), "
-            "'summarize_document' (summarizes file into Word doc), "
-            "'rewrite_document' (transforms/translates file into Word doc)."
+            "Doc/presentation pipeline. Actions: generate_document (Word report), generate_presentation (PPTX deck), "
+            "generate_interactive_deck (HTML5 deck), fill_template (fill Word template), "
+            "answer_questions_in_doc, summarize_document, rewrite_document."
         ),
         "parameters": {
             "type": "OBJECT",
@@ -677,6 +718,27 @@ TOOL_DECLARATIONS = [
     }
 },
     {
+        "name": "deep_think",
+        "description": (
+            "Use ONLY for requests that genuinely need multi-step reasoning or planning — "
+            "e.g. 'plan my exam schedule for the next 2 weeks', 'work out the best strategy for X considering Y and Z', "
+            "'compare these options and reason through the trade-offs', complex math, or multi-constraint decisions. "
+            "Do NOT use for simple facts, small talk, or anything you can already answer directly — "
+            "this tool is slower on purpose because it thinks properly before answering. "
+            "Tell the user briefly that you're thinking it through before calling this."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "task": {
+                    "type": "STRING",
+                    "description": "The full question or planning task to reason through, with all relevant context/constraints included."
+                }
+            },
+            "required": ["task"]
+        }
+    },
+    {
         "name": "save_memory",
         "description": (
             "Save an important personal fact about the user to long-term memory. "
@@ -739,6 +801,11 @@ class TitanLive:
         self._proactive        = ProactiveEngine()
         self._last_user_speech = time.monotonic()  # updated on every user utterance
         self._session_log: list[str] = []          # conversation turns for end-of-session summary
+        self._tool_busy          = False
+        self._tool_lock          = None          # asyncio.Lock, created in run()
+        self._speak_ended_at     = 0.0
+        self._vad_end_t          = 0.0           # for ⚡ first-audio timing
+        self._first_audio_logged = False
 
     def _make_remote_key(self):
         """Called from Qt main thread when user presses Remote Control."""
@@ -772,16 +839,60 @@ class TitanLive:
 
     def set_speaking(self, value: bool):
         with self._speaking_lock:
+            was = self._is_speaking
             self._is_speaking = value
-        if value:
+        if value and not was:
+            # Titan just started talking — drop leftover mic so it cannot
+            # clog the websocket or barge-in on itself.
+            self._flush_out_queue()
             self.ui.set_state("SPEAKING")
-        elif not self.ui.muted:
-            self.ui.set_state("LISTENING")
+        elif not value:
+            self._speak_ended_at = time.monotonic()
+            if not self.ui.muted:
+                self.ui.set_state("LISTENING")
 
-    def interrupt(self) -> None:
-        """Stop TITAN mid-speech: drain queued audio playback immediately."""
+    def _flush_out_queue(self) -> None:
+        q = self.out_queue
+        if not q:
+            return
+        n = 0
+        while True:
+            try:
+                q.get_nowait()
+                n += 1
+            except Exception:
+                break
+        if n:
+            print(f"[TITAN] 🎤 Flushed {n} leftover mic chunks")
+
+    def _qput_audio(self, item: dict) -> None:
+        """Never block the mic callback. If the queue is full, drop oldest."""
+        q = self.out_queue
+        loop = self._loop
+        if not q or not loop:
+            return
+
+        def _do():
+            try:
+                if q.full():
+                    try:
+                        q.get_nowait()
+                    except Exception:
+                        return
+                q.put_nowait(item)
+            except Exception:
+                pass
+
+        try:
+            loop.call_soon_threadsafe(_do)
+        except Exception:
+            pass
+
+    def interrupt(self, flush_mic: bool = False) -> None:
+        """Stop TITAN mid-speech: drain queued audio playback AND optionally mic queue."""
         with self._speaking_lock:
             self._is_speaking = False
+        self._speak_ended_at = time.monotonic()
 
         # Clear incoming AI audio queue immediately so speaker stops
         q = self.audio_in_queue
@@ -794,7 +905,27 @@ class TitanLive:
                 except Exception:
                     break
             if drained:
-                print(f"[TITAN] ✋ Interrupted — {drained} audio chunks discarded")
+                print(f"[TITAN] ✋ Interrupted — {drained} speaker chunks discarded")
+
+        # Always flush the outgoing mic queue so stale words never reach Gemini
+        oq = self.out_queue
+        if oq:
+            mic_drained = 0
+            while True:
+                try:
+                    oq.get_nowait()
+                    mic_drained += 1
+                except Exception:
+                    break
+            if mic_drained:
+                print(f"[TITAN] 🎤 Flushed {mic_drained} pending mic chunks")
+
+        # Also clear the voice gate rolling buffer so old audio fragments don't leak
+        try:
+            from actions.voice_face_id import _VOICE_GATE_BUFFER
+            _VOICE_GATE_BUFFER.clear()
+        except Exception:
+            pass
 
         if self._turn_done_event:
             self._turn_done_event.clear()
@@ -862,13 +993,12 @@ class TitanLive:
             parts.append(mem_str)
         parts.append(sys_prompt)
 
-        return types.LiveConnectConfig(
+        cfg_kwargs = dict(
             response_modalities=["AUDIO"],
             output_audio_transcription={},
             input_audio_transcription={},
             system_instruction="\n".join(parts),
             tools=[{"function_declarations": TOOL_DECLARATIONS}],
-            session_resumption=types.SessionResumptionConfig(),
             speech_config=types.SpeechConfig(
                 voice_config=types.VoiceConfig(
                     prebuilt_voice_config=types.PrebuiltVoiceConfig(
@@ -876,7 +1006,95 @@ class TitanLive:
                     )
                 )
             ),
+            # ── Latency fix #1: kill "thinking" before it speaks ──────────────
+            thinking_config=types.ThinkingConfig(
+                thinking_budget=0,
+                include_thoughts=False,
+            ),
+            # ── Latency fix #2: end-of-turn / VAD detection ───────────────────
+            realtime_input_config=types.RealtimeInputConfig(
+                automatic_activity_detection=types.AutomaticActivityDetection(
+                    disabled=False,
+                    start_of_speech_sensitivity=types.StartSensitivity.START_SENSITIVITY_HIGH,
+                    end_of_speech_sensitivity=types.EndSensitivity.END_SENSITIVITY_HIGH,
+                    prefix_padding_ms=20,
+                    silence_duration_ms=300,
+                )
+            ),
         )
+        # Long sessions (your 20-min capstone chat) otherwise 1011-crash
+        try:
+            cfg_kwargs["context_window_compression"] = types.ContextWindowCompressionConfig(
+                sliding_window=types.SlidingWindow(),
+                trigger_tokens=25000,
+            )
+        except Exception:
+            pass
+        return types.LiveConnectConfig(**cfg_kwargs)
+
+    async def _run_deep_think(self, task: str) -> str:
+        """
+        One-off call to a standard (non-live) Gemini model with full thinking
+        enabled. This runs OUTSIDE the live session, so it never blocks the
+        mic/audio pipeline — the live session stays fast for everything else,
+        and only this specific tool call pays the "thinking" latency cost,
+        on purpose, for tasks that actually need it.
+        """
+        try:
+            memory  = load_memory()
+            mem_str = format_memory_for_prompt(memory)
+
+            prompt = (
+                "You are TITAN's reasoning module. Think through this carefully "
+                "and give a clear, well-structured, spoken-friendly answer "
+                "(it will be read aloud, so keep formatting simple — no markdown tables). "
+                f"\n\nContext about the user:\n{mem_str}\n\nTask:\n{task}"
+            )
+
+            client = genai.Client(
+                api_key=_get_api_key(),
+                http_options={"api_version": "v1beta"},
+            )
+
+            response = await client.aio.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    thinking_config=types.ThinkingConfig(
+                        include_thoughts=False,
+                        thinking_budget=-1,  # Full dynamic deep reasoning (no artificial token limit)
+                    ),
+                ),
+            )
+
+            answer = (response.text or "").strip()
+            return answer or "I thought about it but couldn't come up with a clear answer — could you rephrase the task?"
+
+        except Exception as e:
+            print(f"[DeepThink] ❌ {e}")
+            return f"I ran into an issue while thinking that through: {e}"
+
+    async def _dispatch_tools(self, tool_call) -> None:
+        """Run tools without blocking the websocket receive loop."""
+        if self._tool_lock is None:
+            self._tool_lock = asyncio.Lock()
+        async with self._tool_lock:
+            self._tool_busy = True
+            try:
+                fn_responses = []
+                for fc in tool_call.function_calls:
+                    print(f"[TITAN] 📞 {fc.name}")
+                    fr = await self._execute_tool(fc)
+                    fn_responses.append(fr)
+                if self.session:
+                    await self.session.send_tool_response(
+                        function_responses=fn_responses
+                    )
+            except Exception as e:
+                print(f"[TITAN] ❌ tool dispatch: {e}")
+                traceback.print_exc()
+            finally:
+                self._tool_busy = False
 
     async def _execute_tool(self, fc) -> types.FunctionResponse:
         name = fc.name
@@ -896,7 +1114,7 @@ class TitanLive:
                 self.ui.set_state("LISTENING")
             return types.FunctionResponse(
                 id=fc.id, name=name,
-                response={"result": "ok", "silent": True}
+                response={"result": "Memory saved. Do not repeat what you just said."}
             )
 
         loop   = asyncio.get_event_loop()
@@ -1078,6 +1296,13 @@ class TitanLive:
                     skills_list = skill_engine.list_skills()
                     result = f"Available custom skills: {skills_list}" if skills_list else "No custom skills created yet."
 
+            elif name == "deep_think":
+                task = args.get("task", "").strip()
+                if not task:
+                    result = "No task provided to think through."
+                else:
+                    result = await self._run_deep_think(task)
+
             elif name == "manage_monitor":
                 action = args.get("action", "").lower().strip()
                 topic  = args.get("topic", "").strip()
@@ -1126,46 +1351,103 @@ class TitanLive:
         )
 
     async def _send_realtime(self):
-        _silent_chunk = {"data": b"\x00" * 240, "mime_type": "audio/pcm"}
+        """Push mic packets the instant they arrive. No 12-second backlog."""
+        print("[TITAN] 📡 Send loop started")
         while True:
+            item = await self.out_queue.get()
+            session = self.session
+            if not session or not item:
+                continue
+            kind = item.get("kind", "audio")
             try:
-                msg = await asyncio.wait_for(self.out_queue.get(), timeout=5.0)
-                await self.session.send_realtime_input(media=msg)
-            except asyncio.TimeoutError:
-                if self.session and not self._is_speaking:
-                    try:
-                        await self.session.send_realtime_input(media=_silent_chunk)
-                    except Exception:
-                        pass
+                if kind == "audio":
+                    data = item.get("data")
+                    if not data:
+                        continue
+                    await session.send_realtime_input(
+                        audio=types.Blob(
+                            data=data,
+                            mime_type=_AUDIO_MIME,
+                        )
+                    )
+                elif kind == "end":
+                    await session.send_realtime_input(audio_stream_end=True)
+                    self._vad_end_t = time.monotonic()
+                    self._first_audio_logged = False
+                    _dbg("SEND", "audio_stream_end (local VAD)")
+                    print("[TITAN] 📡 audio_stream_end")
             except Exception as e:
-                print(f"[TITAN] ⚠️ Send error: {e}")
+                print(f"[TITAN] ⚠️ send_realtime: {e}")
 
     async def _listen_audio(self):
         print("[TITAN] 🎤 Mic started")
-        loop = asyncio.get_event_loop()
+        try:
+            import numpy as np
+        except Exception:
+            np = None
+
+        preroll: deque = deque(maxlen=_VAD_PREROLL)
+        state = {"in_speech": False, "silence": 0}
+
+        def _rms(indata) -> float:
+            if np is None:
+                return 0.0
+            try:
+                arr = indata.reshape(-1) if hasattr(indata, "reshape") else np.frombuffer(indata, dtype=np.int16)
+                if arr.size == 0:
+                    return 0.0
+                return float(np.sqrt(np.mean(arr.astype(np.float32) ** 2)))
+            except Exception:
+                return 0.0
 
         def callback(indata, frames, time_info, status):
-            if not self.ui.muted and not self._phone_active:
-                data = indata.tobytes()
-                with self._speaking_lock:
-                    titan_speaking = self._is_speaking
-                
-                # If TITAN is speaking, only send when there is clear voice energy to avoid speaker loop
-                if titan_speaking:
-                    try:
-                        import numpy as np
-                        arr = np.frombuffer(data, dtype=np.int16)
-                        rms = float(np.sqrt(np.mean(arr.astype(np.float32)**2)))
-                        if rms < 900.0:  # Ignore low ambient speaker bleed
-                            return
-                    except Exception:
-                        pass
+            with self._speaking_lock:
+                titan_speaking = self._is_speaking
 
-                if verify_voice(data):
-                    loop.call_soon_threadsafe(
-                        self.out_queue.put_nowait,
-                        {"data": data, "mime_type": "audio/pcm"}
-                    )
+            if self.ui.muted or self._phone_active:
+                return
+
+            rms = _rms(indata)
+
+            # Local "user is talking" clock — do NOT wait for Gemini transcription.
+            # This stops RAM-alerts / proactive from stealing the turn.
+            if rms >= _VAD_START_RMS:
+                self._last_user_speech = time.monotonic()
+
+            # Mute while Titan talks (no AEC — otherwise it interrupts itself).
+            # Also swallow the speaker tail so the last syllable isn't heard as you.
+            if titan_speaking or (time.monotonic() - self._speak_ended_at) < _ECHO_TAIL_S:
+                state["in_speech"] = False
+                state["silence"] = 0
+                preroll.clear()
+                return
+
+            data = indata.tobytes()
+            packet = {"kind": "audio", "data": data, "rms": rms}
+
+            if not state["in_speech"]:
+                preroll.append(packet)
+                if rms >= _VAD_START_RMS:
+                    state["in_speech"] = True
+                    state["silence"] = 0
+                    _dbg("VAD", f"speech start RMS={rms:.0f}")
+                    print(f"[TITAN] 🎤 speech start RMS={rms:.0f}")
+                    for p in preroll:
+                        self._qput_audio(p)
+                    preroll.clear()
+            else:
+                self._qput_audio(packet)
+                if rms < _VAD_HOLD_RMS:
+                    state["silence"] += 1
+                    if state["silence"] >= _VAD_END_SILENCE:
+                        self._qput_audio({"kind": "end"})
+                        state["in_speech"] = False
+                        state["silence"] = 0
+                        preroll.clear()
+                        _dbg("VAD", "speech end")
+                        print("[TITAN] 🎤 speech end")
+                else:
+                    state["silence"] = 0
 
         try:
             with sd.InputStream(
@@ -1191,6 +1473,11 @@ class TitanLive:
                 async for response in self.session.receive():
 
                     if response.data:
+                        if self._vad_end_t and not self._first_audio_logged:
+                            dt = time.monotonic() - self._vad_end_t
+                            print(f"[TITAN] ⚡ first audio in {dt:.2f}s")
+                            self._first_audio_logged = True
+                            self._vad_end_t = 0.0
                         if self._turn_done_event and self._turn_done_event.is_set():
                             self._turn_done_event.clear()
                         # Split into ~50 ms chunks so interrupt() stops audio within 50 ms
@@ -1205,6 +1492,7 @@ class TitanLive:
 
                         # Server-side Gemini Live barge-in signal
                         if getattr(sc, "interrupted", False):
+                            _dbg("RECV", "✋ Gemini barge-in signal received")
                             print("[TITAN] ✋ Gemini Live detected user barge-in — stopping speech")
                             self.interrupt()
 
@@ -1212,10 +1500,12 @@ class TitanLive:
                             txt = _clean_transcript(sc.output_transcription.text)
                             if txt and txt != (out_buf[-1] if out_buf else ""):
                                 out_buf.append(txt)
+                                _dbg("RECV", f"TITAN says: '{txt[:60]}'")
 
                         if sc.input_transcription and sc.input_transcription.text:
                             txt = _clean_transcript(sc.input_transcription.text)
                             if txt:
+                                _dbg("RECV", f"👤 Gemini heard you say: '{txt}'")
                                 with self._speaking_lock:
                                     is_spk = self._is_speaking
                                 if is_spk:
@@ -1282,14 +1572,9 @@ class TitanLive:
                                 asyncio.create_task(_cam_close())
 
                     if response.tool_call:
-                        fn_responses = []
-                        for fc in response.tool_call.function_calls:
-                            print(f"[TITAN] 📞 {fc.name}")
-                            fr = await self._execute_tool(fc)
-                            fn_responses.append(fr)
-                        await self.session.send_tool_response(
-                            function_responses=fn_responses
-                        )
+                        # Do NOT block the receive loop — that stalls the
+                        # websocket, backs up mic send, and causes 1011 errors.
+                        asyncio.create_task(self._dispatch_tools(response.tool_call))
         except Exception as e:
             print(f"[TITAN] ❌ Recv: {e}")
             traceback.print_exc()
@@ -1509,17 +1794,34 @@ class TitanLive:
     # ── System monitor ──────────────────────────────────────────────────────────
 
     async def _run_system_monitor(self) -> None:
-        """Background task: voice alerts when metrics exceed thresholds."""
+        """Background task: voice alerts when metrics exceed thresholds.
+
+        Never hijacks the live session while you are talking, while a tool
+        is running, or for RAM alerts (speaking those uses MORE ram).
+        """
         while True:
-            await asyncio.sleep(10)
+            await asyncio.sleep(30)
             alert = await asyncio.to_thread(self._sys_monitor.check)
-            if not alert or not self.session:
+            if not alert:
                 continue
-            # Don't interrupt an active conversation
+            try:
+                self.ui.write_log(f"SYS: {str(alert)[:160]}")
+            except Exception:
+                pass
+
+            if not self.session:
+                continue
             with self._speaking_lock:
                 speaking = self._is_speaking
-            if speaking or (time.monotonic() - self._last_user_speech) < 10:
+            recent = (time.monotonic() - getattr(self, "_last_user_speech", 0.0)) < 45
+            if speaking or recent or self._tool_busy:
                 continue
+
+            # RAM / memory alerts: log only. Do not make Titan talk.
+            a = str(alert).upper()
+            if "RAM" in a or "MEMORY" in a or "SYSTEM_ALERT" in a or "रैम" in str(alert):
+                continue
+
             try:
                 await self.session.send_client_content(
                     turns={"parts": [{"text": alert}]},
@@ -1539,7 +1841,7 @@ class TitanLive:
                 with self._speaking_lock:
                     speaking = self._is_speaking
                 recent_speech = (time.monotonic() - self._last_user_speech) < 30
-                if not speaking and not recent_speech:
+                if not speaking and not recent_speech and not self._tool_busy:
                     try:
                         alerts = await asyncio.to_thread(monitor_check_all)
                         memory = load_memory()
@@ -1577,7 +1879,7 @@ class TitanLive:
 
             with self._speaking_lock:
                 speaking = self._is_speaking
-            if speaking:
+            if speaking or self._tool_busy:
                 continue
 
             if not self._proactive.should_trigger(self._last_user_speech):
@@ -1617,11 +1919,15 @@ class TitanLive:
             self._phone_active = True   # phone is streaming — silence PC mic
             with self._speaking_lock:
                 speaking = self._is_speaking
-            if not speaking and not self.ui.muted:
-                try:
-                    self.out_queue.put_nowait(chunk)
-                except asyncio.QueueFull:
-                    pass
+            if speaking or self.ui.muted:
+                continue
+            if isinstance(chunk, dict) and chunk.get("data"):
+                data = chunk["data"]
+            elif isinstance(chunk, (bytes, bytearray)):
+                data = bytes(chunk)
+            else:
+                continue
+            self._qput_audio({"kind": "audio", "data": data, "rms": 999.0})
 
     def _on_phone_connected(self) -> None:
         self.ui.write_log("SYS: Phone connected via Remote Dashboard.")
@@ -1711,13 +2017,15 @@ class TitanLive:
                 )
 
                 async with (
-                    client.aio.live.connect(model=LIVE_MODEL, config=config) as session,
+                    client.aio.live.connect(model=_get_live_model(), config=config) as session,
                     asyncio.TaskGroup() as tg,
                 ):
                     self.session          = session
                     self.audio_in_queue   = asyncio.Queue()
-                    self.out_queue        = asyncio.Queue(maxsize=200)
+                    self.out_queue        = asyncio.Queue(maxsize=_SEND_QUEUE_MAX)
                     self._turn_done_event = asyncio.Event()
+                    self._tool_lock       = asyncio.Lock()
+                    self._tool_busy       = False
 
                     # Reset transient state that must not carry over from a previous session
                     self._pending_vision       = None
@@ -1726,6 +2034,8 @@ class TitanLive:
                     self._vision_busy          = False
                     self._vision_last_time     = 0.0
                     self._interrupted          = False
+                    self._vad_end_t            = 0.0
+                    self._first_audio_logged   = False
 
                     print("[TITAN] Connected.")
                     self.ui.set_state("LISTENING")
@@ -1764,8 +2074,13 @@ class TitanLive:
                 is_net_err = any(k in err_str for k in (
                     "TimeoutError", "timed out", "getaddrinfo", "CancelledError",
                     "ConnectionRefusedError", "OSError", "Cannot connect",
-                    "1011", "1006", "1000", "Internal error", "ConnectionClosedError", "APIError",
+                    "1011", "1007", "1006", "1000", "Internal error", "ConnectionClosedError", "APIError",
                 ))
+
+                # Auto-rotate model on audio content type rejection
+                if "CONTENT_TYPE_AUDIO" in err_str or "not supported for this model" in err_str:
+                    _rotate_live_model()
+                    self._conn_backoff = 3  # Reset backoff for new model
 
                 print(f"[TITAN] Exception ({type(e).__name__}): {e}")
                 if not is_net_err:

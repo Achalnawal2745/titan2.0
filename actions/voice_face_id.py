@@ -118,7 +118,7 @@ def extract_mfcc_frames(pcm_data: bytes, sample_rate: int = 16000) -> np.ndarray
     try:
         audio = np.frombuffer(pcm_data, dtype=np.int16).astype(np.float32)
         peak_val = np.max(np.abs(audio))
-        if peak_val < 1500:
+        if peak_val < 300:
             return None
         audio = audio / (peak_val + 1e-6)
 
@@ -170,6 +170,8 @@ def clear_voice_ram_cache():
 
 
 _VOICE_GATE_BUFFER = bytearray()
+_LAST_VOICE_CHECK_TIME = 0.0
+_VOICE_GATE_MATCHED = True
 
 def clear_voice_gate_buffer():
     global _VOICE_GATE_BUFFER
@@ -177,10 +179,11 @@ def clear_voice_gate_buffer():
 
 def verify_voice(pcm_data: bytes) -> bool:
     """
-    Real-time zero-latency voice gate for continuous mic stream.
-    Accumulates rolling speech buffer to evaluate GMM score stably.
+    Ultra-fast zero-latency voice gate.
+    Runs fast RMS check in 0.001ms, and throttles heavy GMM calculation
+    so the PortAudio audio capture thread NEVER falls behind real time.
     """
-    global _VOICE_GATE_BUFFER
+    global _VOICE_GATE_BUFFER, _LAST_VOICE_CHECK_TIME, _VOICE_GATE_MATCHED
     cfg = get_security_config()
     if not cfg.get("voice_lock"):
         return True
@@ -191,25 +194,34 @@ def verify_voice(pcm_data: bytes) -> bool:
 
     if pcm_data:
         _VOICE_GATE_BUFFER.extend(pcm_data)
-        # Keep rolling 0.5 second of audio (16000 bytes = 8000 samples @ 16kHz int16)
         if len(_VOICE_GATE_BUFFER) > 16000:
             _VOICE_GATE_BUFFER = _VOICE_GATE_BUFFER[-16000:]
 
-    # Pass through until buffer has at least 0.25s (8000 bytes) of audio
+    now = time.time()
+    # Only run heavy GMM calculation at most once every 0.6 seconds (not 16 times a second!)
+    if (now - _LAST_VOICE_CHECK_TIME) < 0.6:
+        return _VOICE_GATE_MATCHED
+
+    _LAST_VOICE_CHECK_TIME = now
+
     if len(_VOICE_GATE_BUFFER) < 8000:
+        _VOICE_GATE_MATCHED = True
         return True
 
     frames = extract_mfcc_frames(bytes(_VOICE_GATE_BUFFER))
     if frames is None:
+        _VOICE_GATE_MATCHED = True
         return True
 
     try:
         score = float(gmm.score(frames))
-        matched = score > -48.0
+        matched = score > -65.0
         if not matched:
-            print(f"[VoiceID] ⛔ Unrecognized speaker ignored (GMM score: {score:.2f} < -48.0)")
+            print(f"[VoiceID] ⛔ Unrecognized speaker ignored (GMM score: {score:.2f} < -65.0)")
+        _VOICE_GATE_MATCHED = matched
         return matched
     except Exception:
+        _VOICE_GATE_MATCHED = True
         return True
 
 

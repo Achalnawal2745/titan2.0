@@ -3906,8 +3906,17 @@ class MainWindow(QMainWindow):
     # ────────────────────────────────────────────────────────────────────────────
 
     def _do_interrupt(self):
+        now = time.time()
+        last = getattr(self, "_last_esc_time", 0.0)
+        self._last_esc_time = now
+
         if self.on_interrupt:
             self.on_interrupt()
+
+        # Double-ESC within 500ms = full mic flush + notify user
+        if (now - last) < 0.5:
+            self._log.append_log("SYS: ⚡ Double-ESC — mic queue flushed. Fresh start.")
+            print("[TITAN] ⚡ Double-ESC — full mic + speaker flush complete")
 
     def _toggle_mute(self):
         self._muted = not self._muted

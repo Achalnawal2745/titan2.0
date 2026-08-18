@@ -1,12 +1,8 @@
 {
   "name": "titan-extension",
-  "version": "0.1.13",
-  "description": "AI web automation tool",
+  "version": "1.0.0",
+  "description": "TITAN Browser Agent - Autonomous AI Web Automation Extension",
   "license": "Apache-2.0",
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/nanobrowser/nanobrowser.git"
-  },
   "type": "module",
   "scripts": {
     "clean:bundle": "rimraf dist && turbo clean:bundle",
