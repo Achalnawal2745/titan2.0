@@ -626,6 +626,11 @@ class HudCanvas(QWidget):
             p.setBrush(QBrush(c))
             p.drawRect(QRectF(sx + i * bw, wy - h / 2, bw - 2, h))
 
+    def mousePressEvent(self, event):
+        if hasattr(self, "on_clicked") and callable(self.on_clicked):
+            self.on_clicked()
+        super().mousePressEvent(event)
+
 
 class MetricBar(QWidget):
 
@@ -2242,6 +2247,7 @@ class MainWindow(QMainWindow):
     _sec_refresh_sig = pyqtSignal()          # refresh security buttons on UI (thread-safe)
     _enroll_face_sig = pyqtSignal()          # open visual face enrollment window (thread-safe)
     _lock_screen_sig = pyqtSignal()          # open lock screen dialog on main thread (thread-safe)
+    _esc_sig         = pyqtSignal()          # global ESC / interrupt signal
 
     def __init__(self, face_path: str):
         super().__init__()
@@ -2295,6 +2301,8 @@ class MainWindow(QMainWindow):
         # Center column: HUD + resizable content panel via QSplitter
         self.hud = HudCanvas(face_path, _display)
         self.hud.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.hud.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.hud.on_clicked = self._do_interrupt
         self._content_panel = self._build_content_panel()
 
         # Live camera container — replaces HUD when camera stream is active
@@ -2381,7 +2389,9 @@ class MainWindow(QMainWindow):
 
         # Global ESC Shortcut: Instant Interrupt / Stop Speech / Reset Listening
         self._esc_shortcut = QShortcut(QKeySequence(Qt.Key.Key_Escape), self)
+        self._esc_shortcut.setContext(Qt.ShortcutContext.ApplicationShortcut)
         self._esc_shortcut.activated.connect(self._do_interrupt)
+        self._esc_sig.connect(self._do_interrupt)
         self._terminal_sig.connect(self._terminal_overlay.append_log)
 
         # Pipe raw stdout & stderr ONLY to Terminal Console (keeping Activity Stream clean)
@@ -2422,8 +2432,9 @@ class MainWindow(QMainWindow):
         sc_mute.activated.connect(self._toggle_mute)
         sc_full = QShortcut(QKeySequence("F11"), self)
         sc_full.activated.connect(self._toggle_fullscreen)
-        sc_intr = QShortcut(QKeySequence("Escape"), self)
-        sc_intr.activated.connect(self._do_interrupt)
+
+        if platform.system() == "Windows":
+            self._start_global_esc_listener()
 
     def _show_camera_frame(self, img_bytes: bytes):
         """Slot — display camera preview overlay (main thread)."""
@@ -3915,8 +3926,34 @@ class MainWindow(QMainWindow):
 
         # Double-ESC within 500ms = full mic flush + notify user
         if (now - last) < 0.5:
-            self._log.append_log("SYS: ⚡ Double-ESC — mic queue flushed. Fresh start.")
+            self._log.append_log("SYS: ⚡ Double-ESC — full mic & queue reset.")
             print("[TITAN] ⚡ Double-ESC — full mic + speaker flush complete")
+        else:
+            self._log.append_log("SYS: 🛑 ESC — speech interrupted / listening.")
+            print("[TITAN] 🛑 ESC key pressed — interrupted speech")
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Escape:
+            self._do_interrupt()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def _start_global_esc_listener(self):
+        import ctypes
+        def _esc_worker():
+            was_down = False
+            while True:
+                time.sleep(0.025)
+                try:
+                    state = ctypes.windll.user32.GetAsyncKeyState(0x1B)
+                    is_down = bool(state & 0x8000)
+                    if is_down and not was_down:
+                        self._esc_sig.emit()
+                    was_down = is_down
+                except Exception:
+                    pass
+        threading.Thread(target=_esc_worker, daemon=True, name="global-esc-listener").start()
 
     def _toggle_mute(self):
         self._muted = not self._muted

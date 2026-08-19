@@ -27,9 +27,18 @@ memory/*.json
 memory/*.npy
 memory/*.pkl
 memory/*.bin
+memory/workpad.json
+memory/workpad.md
 !memory/config_manager.py
 !memory/memory_manager.py
+!memory/work_pad.py
 !memory/__init__.py
+
+# ── Dynamic Skills Sandbox & Metadata ────────────────────────────────────────
+skills/_sandbox/venv/
+skills/_sandbox/
+skills/_meta/
+hello/
 
 # ── API Keys, Certificates & Secrets ─────────────────────────────────────────
 config/*.json

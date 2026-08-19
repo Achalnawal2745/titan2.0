@@ -1,10 +1,13 @@
 import json
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
-from datetime import datetime
+import threading
+import time
+from datetime import datetime, timedelta
 from pathlib import Path
 
 _CNW: dict = (
@@ -45,13 +48,37 @@ def _sanitise(text: str, max_len: int = 200) -> str:
 
 def _write_notify_script(task_name: str, message: str, os_name: str) -> Path:
     script_path = _scripts_dir() / f"{task_name}.py"
-    msg_literal = json.dumps(message)  
+    msg_literal = json.dumps(message, ensure_ascii=True)
 
     if os_name == "windows":
         notify_block = f"""
 message = {msg_literal}
 notified = False
 
+# 1. Chime Sound
+try:
+    import winsound
+    for freq in [800, 1000, 1200]:
+        winsound.Beep(freq, 180)
+        import time; time.sleep(0.08)
+except Exception:
+    pass
+
+# 2. Speak Aloud (TTS)
+try:
+    import subprocess
+    clean_speech = message.replace("'", "").replace('"', "")
+    ps_tts = f"(New-Object -ComObject SAPI.SpVoice).Speak('Sir, here is your reminder: {{clean_speech}}')"
+    subprocess.Popen(
+        ["powershell", "-NoProfile", "-Command", ps_tts],
+        creationflags=0x08000000,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL
+    )
+except Exception:
+    pass
+
+# 3. Notification Toast
 try:
     from plyer import notification
     notification.notify(title="TITAN Reminder", message=message, timeout=15)
@@ -67,18 +94,10 @@ if not notified:
     except Exception:
         pass
 
-if not notified:
-    try:
-        import subprocess
-        subprocess.run(["msg", "*", "/TIME:30", message], check=False)
-    except Exception:
-        pass
-
+# 4. Pop-up Message Box
 try:
-    import winsound
-    for freq in [800, 1000, 1200]:
-        winsound.Beep(freq, 180)
-        import time; time.sleep(0.08)
+    import ctypes
+    ctypes.windll.user32.MessageBoxW(0, message, "TITAN Reminder", 0x40 | 0x10000 | 0x1000)
 except Exception:
     pass
 """
@@ -87,6 +106,13 @@ except Exception:
         notify_block = f"""
 message = {msg_literal}
 notified = False
+
+try:
+    import subprocess
+    clean_speech = message.replace('"', '').replace("'", "")
+    subprocess.Popen(["say", f"Sir, here is your reminder: {{clean_speech}}"])
+except Exception:
+    pass
 
 try:
     from plyer import notification
@@ -191,98 +217,93 @@ def _schedule_windows(target_dt: datetime, task_name: str,
         pass
 
     if result.returncode != 0:
-        script_path.unlink(missing_ok=True)
-        err = (result.stderr or result.stdout).strip()
-        print(f"[Reminder] ❌ schtasks: {err}")
-        return ""  
+        # Fallback to standard CLI schtasks
+        st_time = target_dt.strftime("%H:%M")
+        sd_date = target_dt.strftime("%d/%m/%Y")
+        tr_cmd  = f'"{python_exe}" "{script_path}"'
+        res2 = subprocess.run(
+            ["schtasks", "/Create", "/SC", "ONCE", "/TN", task_name, "/TR", tr_cmd, "/ST", st_time, "/SD", sd_date, "/F"],
+            capture_output=True, text=True, **_CNW,
+        )
+        if res2.returncode != 0:
+            err = (res2.stderr or res2.stdout or result.stderr or "").strip()
+            print(f"[Reminder] ❌ schtasks failed: {err}")
+            # Still schedule an in-process thread timer fallback for current session
+            diff = (target_dt - datetime.now()).total_seconds()
+            if 0 < diff <= 86400:
+                import threading
+                def _run_delayed():
+                    import time
+                    time.sleep(diff)
+                    try:
+                        subprocess.Popen([str(python_exe), str(script_path)], **_CNW)
+                    except Exception:
+                        pass
+                threading.Thread(target=_run_delayed, daemon=True, name=f"reminder-{task_name}").start()
+                return task_name
+            script_path.unlink(missing_ok=True)
+            return ""
 
     return task_name
 
 
-def _schedule_mac(target_dt: datetime, task_name: str,
-                  script_path: Path) -> str:
-    agents_dir = Path.home() / "Library" / "LaunchAgents"
-    agents_dir.mkdir(parents=True, exist_ok=True)
+def _parse_flexible_datetime(date_str: str, time_str: str) -> datetime | None:
+    """Parses date/time strings in multiple natural formats or relative durations."""
+    from datetime import timedelta
+    now = datetime.now()
+    combined = f"{date_str} {time_str}".strip().lower()
 
-    label     = f"com.titan.reminder.{task_name}"
-    plist_path = agents_dir / f"{label}.plist"
+    # Relative time matching (e.g. "in 5 minutes", "10m", "1 hour", "30 mins")
+    rel_m = re.search(r"(\d+)\s*(m|min|minute|minutes|h|hr|hour|hours|s|sec|seconds)", combined)
+    if "in " in combined or rel_m:
+        if rel_m:
+            val = int(rel_m.group(1))
+            unit = rel_m.group(2)
+            if unit.startswith("h"):
+                return now + timedelta(hours=val)
+            elif unit.startswith("s"):
+                return now + timedelta(seconds=val)
+            else:
+                return now + timedelta(minutes=val)
 
-    plist_content = f"""<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key>             <string>{label}</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>{sys.executable}</string>
-    <string>{script_path}</string>
-  </array>
-  <key>StartCalendarInterval</key>
-  <dict>
-    <key>Year</key>   <integer>{target_dt.year}</integer>
-    <key>Month</key>  <integer>{target_dt.month}</integer>
-    <key>Day</key>    <integer>{target_dt.day}</integer>
-    <key>Hour</key>   <integer>{target_dt.hour}</integer>
-    <key>Minute</key> <integer>{target_dt.minute}</integer>
-  </dict>
-  <key>RunAtLoad</key>         <false/>
-  <key>StandardOutPath</key>   <string>/dev/null</string>
-  <key>StandardErrorPath</key> <string>/dev/null</string>
-</dict>
-</plist>
-"""
-    plist_path.write_text(plist_content, encoding="utf-8")
-    plist_path.chmod(0o644)
+    # Clean date
+    d_part = date_str.strip().lower()
+    if not d_part or d_part in ("today", "now"):
+        d_part = now.strftime("%Y-%m-%d")
+    elif d_part == "tomorrow":
+        d_part = (now + timedelta(days=1)).strftime("%Y-%m-%d")
 
-    result = subprocess.run(
-        ["launchctl", "load", str(plist_path)],
-        capture_output=True, text=True,
-    )
+    t_part = time_str.strip().upper()
+    formats_to_try = [
+        ("%Y-%m-%d %H:%M", f"{d_part} {t_part}"),
+        ("%Y-%m-%d %I:%M %p", f"{d_part} {t_part}"),
+        ("%Y-%m-%d %I:%M%p", f"{d_part} {t_part}"),
+        ("%Y-%m-%d %I %p", f"{d_part} {t_part}"),
+        ("%Y-%m-%d %H:%M:%S", f"{d_part} {t_part}"),
+        ("%d-%m-%Y %H:%M", f"{d_part} {t_part}"),
+        ("%Y/%m/%d %H:%M", f"{d_part} {t_part}"),
+        ("%d/%m/%Y %H:%M", f"{d_part} {t_part}"),
+    ]
 
-    if result.returncode != 0:
-        plist_path.unlink(missing_ok=True)
-        script_path.unlink(missing_ok=True)
-        print(f"[Reminder] ❌ launchctl: {result.stderr.strip()}")
-        return ""
+    for fmt, val_str in formats_to_try:
+        try:
+            return datetime.strptime(val_str, fmt)
+        except ValueError:
+            continue
 
-    return label
+    # Try parsing just time_str as HH:MM today
+    for t_fmt in ("%H:%M", "%I:%M %p", "%I:%M%p", "%I %p"):
+        try:
+            t_obj = datetime.strptime(t_part, t_fmt).time()
+            target = datetime.combine(now.date(), t_obj)
+            if target <= now:
+                target += timedelta(days=1)
+            return target
+        except ValueError:
+            continue
 
+    return None
 
-def _schedule_linux(target_dt: datetime, task_name: str,
-                    script_path: Path) -> str:
-
-    if shutil.which("systemd-run"):
-        on_calendar = target_dt.strftime("%Y-%m-%d %H:%M:00")
-        result = subprocess.run(
-            [
-                "systemd-run",
-                "--user",
-                f"--on-calendar={on_calendar}",
-                f"--unit={task_name}",
-                "--",
-                sys.executable, str(script_path),
-            ],
-            capture_output=True, text=True,
-        )
-        if result.returncode == 0:
-            return task_name
-        print(f"[Reminder] ⚠️ systemd-run failed: {result.stderr.strip()}, trying 'at'")
-
-    if shutil.which("at"):
-        at_time = target_dt.strftime("%H:%M %Y-%m-%d")
-        cmd_str = f"{sys.executable} {script_path}\n"
-        result  = subprocess.run(
-            ["at", at_time],
-            input=cmd_str, capture_output=True, text=True,
-        )
-        if result.returncode == 0:
-            return task_name
-        print(f"[Reminder] ❌ at: {result.stderr.strip()}")
-        return ""
-
-    print("[Reminder] ❌ Neither systemd-run nor at found on this Linux system.")
-    return ""
 
 def reminder(
     parameters: dict,
@@ -290,21 +311,19 @@ def reminder(
     player=None,
     session_memory=None,
 ) -> str:
+    date_str = str(parameters.get("date") or "").strip()
+    time_str = str(parameters.get("time") or "").strip()
+    message  = str(parameters.get("message") or "Reminder").strip()
 
-    date_str = parameters.get("date", "").strip()
-    time_str = parameters.get("time", "").strip()
-    message  = parameters.get("message", "Reminder").strip()
+    if not time_str and not date_str:
+        return "I need a time or duration to set a reminder."
 
-    if not date_str or not time_str:
-        return "I need both a date and a time to set a reminder."
-
-    try:
-        target_dt = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M")
-    except ValueError:
-        return "I couldn't parse that date or time. Please use YYYY-MM-DD and HH:MM."
+    target_dt = _parse_flexible_datetime(date_str, time_str)
+    if not target_dt:
+        return "I couldn't parse that date or time. Please specify time like '5:00 PM' or 'in 10 minutes'."
 
     if target_dt <= datetime.now():
-        return "That time has already passed — I can't set a reminder in the past."
+        return "That time has already passed — please specify a future time."
 
     os_name    = _get_os()
     safe_msg   = _sanitise(message)
@@ -331,7 +350,7 @@ def reminder(
         return "I couldn't register the reminder with the system scheduler."
 
     if player:
-        player.write_log(f"[Reminder] ✅ {date_str} {time_str} — {safe_msg[:40]}")
+        player.write_log(f"[Reminder] ✅ {target_dt.strftime('%Y-%m-%d %H:%M')} — {safe_msg[:40]}")
 
     friendly_time = target_dt.strftime("%B %d at %I:%M %p")
     return f"Reminder set for {friendly_time}."

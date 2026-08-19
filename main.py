@@ -1,13 +1,17 @@
 import os
+import warnings
+os.environ["PYTHONWARNINGS"] = "ignore"
+warnings.simplefilter("ignore", DeprecationWarning)
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+warnings.filterwarnings("ignore", module="sounddevice")
+warnings.filterwarnings("ignore", message=".*Setting the shape on a NumPy array.*")
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["NUMEXPR_NUM_THREADS"] = "1"
 os.environ["OMP_NUM_THREADS"] = "1"
 import platform as _platform
 import subprocess as _subprocess
-import warnings
 os.environ["QT_LOGGING_RULES"] = "*.debug=false;qt.qpa.*=false;qt.text.*=false;qt.qpa.window=false"
-warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 try:
     import colorama
@@ -87,6 +91,7 @@ from actions.voice_face_id import (
 )
 from actions.web_search        import _news as _fetch_news_sync
 from memory.config_manager     import get_brief_enabled
+from memory.work_pad           import run_work_pad, format_for_prompt as format_pad_for_prompt
 
 
 def get_base_dir():
@@ -126,12 +131,16 @@ _DEBUG_AUDIO = False          # was True — per-chunk prints stall the event lo
 _dbg_chunk_count = 0
 
 # Local VAD — stream speech only, then tell Gemini "user stopped"
-_VAD_START_RMS      = 420.0   # start of a user utterance
-_VAD_HOLD_RMS       = 260.0   # stay in-speech (hysteresis)
-_VAD_PREROLL        = 6       # ~192 ms kept BEFORE speech so first word isn't clipped
-_VAD_END_SILENCE    = 14      # ~448 ms of quiet → end of turn
-_SEND_QUEUE_MAX     = 16      # ~0.5 s max buffer  (was 200 = 12.8 s of lag)
-_ECHO_TAIL_S        = 0.25    # ignore mic this long after Titan stops talking
+# Real speech in your logs is RMS 800–1900. 420 was picking up echo → fake turns.
+_VAD_START_RMS      = 580.0
+_VAD_HOLD_RMS       = 320.0
+_VAD_PREROLL        = 6       # ~192 ms before speech start
+_VAD_END_SILENCE    = 18      # ~576 ms quiet → end of turn
+_VAD_MIN_SPEECH     = 10      # need ~320 ms of real speech before we may end
+_SEND_QUEUE_MAX     = 16
+_ECHO_TAIL_S        = 0.85    # swallow speaker tail (was 0.25 — too short)
+_VAD_SUPPRESS_S     = 0.90    # after ESC / interrupt, ignore mic this long
+_END_DEBOUNCE_S     = 1.10    # don't send audio_stream_end twice in a row
 _AUDIO_MIME         = "audio/pcm;rate=16000"
 
 def _dbg(tag: str, msg: str):
@@ -143,6 +152,21 @@ def _dbg(tag: str, msg: str):
 def _get_api_key() -> str:
     with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
         return json.load(f)["gemini_api_key"]
+
+
+def get_live_clock() -> str:
+    """True local wall clock from this PC — not the frozen session-start time."""
+    now = datetime.now().astimezone()
+    off = now.strftime("%z")
+    off_h = f"{off[:3]}:{off[3:]}" if off else ""
+    tz = now.tzname() or "local"
+    return (
+        f"LIVE PC CLOCK (do not guess — this is the real time right now)\n"
+        f"Date: {now.strftime('%A, %B %d, %Y')}\n"
+        f"Time: {now.strftime('%I:%M:%S %p')}  ({now.strftime('%H:%M:%S')})\n"
+        f"Timezone: {tz} (UTC{off_h})\n"
+        f"ISO: {now.isoformat(timespec='seconds')}"
+    )
 
 
 def _load_system_prompt() -> str:
@@ -158,12 +182,53 @@ def _load_system_prompt() -> str:
     
     try:
         from actions.skill_engine import skill_engine
-        active_skills = skill_engine.list_skills()
-        if active_skills:
-            prompt_text += f"\n\nCURRENT ACTIVE CUSTOM SKILLS: {active_skills}\n"
-            prompt_text += "PROACTIVE SKILL RULE: When the user asks for any task matching an active skill, call skill_engine action='execute_skill' IMMEDIATELY and PROACTIVELY. Never ask the user 'should I use my skill' or say you cannot measure/do it — execute the skill autonomously on first mention!"
+        detailed = []
+        try:
+            detailed = skill_engine.list_skills_detailed()
+        except Exception:
+            detailed = [{"name": n} for n in skill_engine.list_skills()]
+        if detailed:
+            prompt_text += f"\n\nCURRENT ACTIVE CUSTOM SKILLS: {detailed}\n"
+            prompt_text += (
+                "PROACTIVE SKILL RULE: When the user asks for any task matching an active skill, "
+                "call skill_engine action='execute_skill' IMMEDIATELY. "
+                "Never ask 'should I use my skill' — just run it.\n"
+            )
+        prompt_text += (
+            "\n\nSKILL-MAKING RULES (you CAN invent new abilities):\n"
+            "If no built-in tool can do the job (gold price, cricket score, PDF invoice parse, "
+            "unit convert, custom calculator, etc.) you MUST create a skill instead of saying you cannot.\n"
+            "Workflow:\n"
+            "1) Tell the user in ONE short sentence that you are writing a skill.\n"
+            "2) skill_engine action='create_skill' with COMPLETE python:\n"
+            "   REQUIREMENTS = [\"requests\"]   # pip names, or [] if stdlib only\n"
+            "   def do_the_thing(...): ...\n"
+            "   def test():\n"
+            "       r = do_the_thing()\n"
+            "       assert r is not None\n"
+            "       return True\n"
+            "3) If the result is SAVED_BUT_TESTS_FAILED: read the traceback, fix the code, "
+            "call action='edit_skill' with the FULL new file. Repeat until success=True.\n"
+            "4) Then action='execute_skill' with function_name + kwargs and speak the result.\n"
+            "Never pip-install into the user's main Python — the engine uses its own sandbox venv.\n"
+            "Use action='run_command' only for sandbox pip/python/pytest (e.g. 'pip list', 'python -c \"import pandas; print(pandas.__version__)\"').\n"
+            "Use action='test_skill' to re-run tests without rewriting.\n"
+        )
     except Exception:
         pass
+
+    try:
+        pad_txt = format_pad_for_prompt()
+        if pad_txt:
+            prompt_text += "\n\n" + pad_txt
+    except Exception:
+        pass
+
+    prompt_text += (
+        "\n\nCLOCK RULE: The date/time printed at session start goes STALE. "
+        "Whenever the user asks the time, date, today, tomorrow, or you need the time for a reminder, "
+        "you MUST call get_clock first and speak THAT result. Never invent or remember the time.\n"
+    )
 
     prompt_text += (
         "\n\nREASONING RULE: You respond fast and directly for normal conversation and tool calls — "
@@ -279,24 +344,86 @@ TOOL_DECLARATIONS = [
     {
         "name": "skill_engine",
         "description": (
-            "Autonomous Skill Lifecycle & Execution Engine. "
-            "Allows TITAN to dynamically write, edit, delete, inspect, test in sandbox, "
-            "and execute custom Python skills at runtime. "
-            "Actions: 'create_skill' (writes & verifies in sandbox), "
-            "'edit_skill' (updates existing skill & re-verifies in sandbox), "
-            "'delete_skill' (removes skill from disk & unloads from memory), "
-            "'get_code' (reads source code of saved skill), "
-            "'list_skills' (lists all saved skills), "
-            "'execute_skill' (runs a function inside a saved skill)."
+            "Write, sandbox-test, and run NEW Python abilities at runtime. "
+            "Use this when no other tool can do the job. "
+            "create_skill writes the file, pip-installs REQUIREMENTS into an isolated venv "
+            "(never TITAN's own env), then runs test() inside that venv. "
+            "If tests fail, edit_skill with the FULL fixed file and try again. "
+            "Then execute_skill to actually run it. "
+            "Actions: create_skill | edit_skill | test_skill | execute_skill | "
+            "install_deps | run_command | get_code | skill_info | list_skills | delete_skill."
         ),
         "parameters": {
             "type": "OBJECT",
             "properties": {
-                "action": {"type": "STRING", "description": "create_skill | edit_skill | delete_skill | get_code | list_skills | execute_skill"},
-                "skill_name": {"type": "STRING", "description": "Name of the skill (e.g. 'crypto_tracker', 'pdf_invoice_parser')"},
-                "python_code": {"type": "STRING", "description": "Python code for create_skill or edit_skill"},
-                "function_name": {"type": "STRING", "description": "Name of function to run for execute_skill"},
-                "kwargs": {"type": "OBJECT", "description": "Arguments to pass to the function"}
+                "action": {
+                    "type": "STRING",
+                    "description": (
+                        "create_skill | edit_skill | test_skill | execute_skill | "
+                        "install_deps | run_command | get_code | skill_info | list_skills | delete_skill"
+                    )
+                },
+                "skill_name": {"type": "STRING", "description": "e.g. 'gold_price', 'invoice_parser'"},
+                "python_code": {
+                    "type": "STRING",
+                    "description": (
+                        "FULL skill file for create_skill/edit_skill. Must include "
+                        "REQUIREMENTS = [\"pip-name\", ...] (or []), at least one public function, "
+                        "and def test(): that asserts something real."
+                    )
+                },
+                "function_name": {"type": "STRING", "description": "Function to run for execute_skill"},
+                "kwargs": {"type": "OBJECT", "description": "Arguments for execute_skill"},
+                "packages": {
+                    "type": "ARRAY",
+                    "items": {"type": "STRING"},
+                    "description": "Pip packages for install_deps (installed only in the sandbox venv)"
+                },
+                "command": {
+                    "type": "STRING",
+                    "description": "Sandbox-only command for run_command: 'pip list', 'pip install x', 'python -c \"...\"', 'pytest'"
+                }
+            },
+            "required": ["action"]
+        }
+    },
+    {
+        "name": "get_clock",
+        "description": (
+            "Returns this PC's LIVE local date, time, weekday and timezone RIGHT NOW. "
+            "MUST be called for any time/date question or when computing reminder times. "
+            "Never guess the time from memory or from the session-start clock."
+        ),
+        "parameters": {"type": "OBJECT", "properties": {}, "required": []}
+    },
+    {
+        "name": "work_pad",
+        "description": (
+            "TITAN's working notebook. Several jobs at once, each with a checklist. "
+            "Use for any multi-step work (report, skill, files). "
+            "Actions: show | add_job | add_step | check | note | edit_job | "
+            "rewrite_steps | remove_step | remove_job | clear_done. "
+            "Silently update as you work. When the user asks what's left / what's done, call show."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "action": {
+                    "type": "STRING",
+                    "description": (
+                        "show | add_job | add_step | check | note | edit_job | "
+                        "rewrite_steps | remove_step | remove_job | clear_done"
+                    )
+                },
+                "job": {"type": "STRING", "description": "Job id or title (e.g. 'capstone', 'gold_price')"},
+                "title": {"type": "STRING", "description": "Job title for add_job / edit_job"},
+                "goal": {"type": "STRING", "description": "One-line goal for add_job / edit_job"},
+                "text": {"type": "STRING", "description": "Step text, note text, or free text"},
+                "step": {"type": "STRING", "description": "Step number (1-based) or step text for check / remove_step"},
+                "state": {"type": "STRING", "description": "todo | doing | done | blocked  (for check)  OR active | paused | done (for edit_job)"},
+                "steps": {"type": "STRING", "description": "For add_job / rewrite_steps: 'step one | step two | step three'"},
+                "note": {"type": "STRING", "description": "Optional note on a step when checking it"},
+                "status": {"type": "STRING", "description": "active | paused | done for edit_job"},
             },
             "required": ["action"]
         }
@@ -806,6 +933,10 @@ class TitanLive:
         self._speak_ended_at     = 0.0
         self._vad_end_t          = 0.0           # for ⚡ first-audio timing
         self._first_audio_logged = False
+        self._play_stream        = None
+        self._drop_model_audio   = False         # ESC / interrupt: discard incoming audio
+        self._vad_suppress_until = 0.0
+        self._last_stream_end    = 0.0
 
     def _make_remote_key(self):
         """Called from Qt main thread when user presses Remote Control."""
@@ -889,12 +1020,27 @@ class TitanLive:
             pass
 
     def interrupt(self, flush_mic: bool = False) -> None:
-        """Stop TITAN mid-speech: drain queued audio playback AND optionally mic queue."""
+        """Hard stop: mute speaker NOW, drop leftover Gemini audio, ignore echo."""
+        now = time.monotonic()
         with self._speaking_lock:
             self._is_speaking = False
-        self._speak_ended_at = time.monotonic()
+        self._interrupted = True
+        self._drop_model_audio = True
+        self._speak_ended_at = now
+        self._vad_suppress_until = now + _VAD_SUPPRESS_S
 
-        # Clear incoming AI audio queue immediately so speaker stops
+        # Kill PortAudio buffer so ESC actually silences the speaker
+        stream = self._play_stream
+        if stream is not None:
+            try:
+                stream.abort()
+            except Exception:
+                pass
+            try:
+                stream.start()
+            except Exception:
+                pass
+
         q = self.audio_in_queue
         if q:
             drained = 0
@@ -907,7 +1053,6 @@ class TitanLive:
             if drained:
                 print(f"[TITAN] ✋ Interrupted — {drained} speaker chunks discarded")
 
-        # Always flush the outgoing mic queue so stale words never reach Gemini
         oq = self.out_queue
         if oq:
             mic_drained = 0
@@ -920,7 +1065,6 @@ class TitanLive:
             if mic_drained:
                 print(f"[TITAN] 🎤 Flushed {mic_drained} pending mic chunks")
 
-        # Also clear the voice gate rolling buffer so old audio fragments don't leak
         try:
             from actions.voice_face_id import _VOICE_GATE_BUFFER
             _VOICE_GATE_BUFFER.clear()
@@ -971,9 +1115,9 @@ class TitanLive:
         now      = datetime.now()
         time_str = now.strftime("%A, %B %d, %Y — %I:%M %p")
         time_ctx = (
-            f"[CURRENT DATE & TIME]\n"
-            f"Right now it is: {time_str}\n"
-            f"Use this to calculate exact times for reminders.\n\n"
+            f"[SESSION-START CLOCK — may be stale]\n"
+            f"Session opened around: {time_str}\n"
+            f"If the user asks the time/date, call get_clock. Do not use this stamp.\n\n"
         )
 
         # Identity injection — overrides any hardcoded name in prompt.txt
@@ -991,6 +1135,12 @@ class TitanLive:
         parts = [time_ctx, identity_ctx]
         if mem_str:
             parts.append(mem_str)
+        try:
+            pad_txt = format_pad_for_prompt()
+            if pad_txt:
+                parts.append(pad_txt)
+        except Exception:
+            pass
         parts.append(sys_prompt)
 
         cfg_kwargs = dict(
@@ -1269,12 +1419,37 @@ class TitanLive:
                 result = str(r)
 
             elif name == "skill_engine":
-                action = args.get("action", "list_skills").strip()
-                s_name = args.get("skill_name", "").strip()
-                code   = args.get("python_code", "")
+                action = (args.get("action") or "list_skills").strip()
+                s_name = (args.get("skill_name") or "").strip()
+                code   = args.get("python_code") or ""
+                extra_pkgs = args.get("packages") or []
+                if isinstance(extra_pkgs, str):
+                    extra_pkgs = [p.strip() for p in extra_pkgs.replace(",", " ").split() if p.strip()]
 
                 if action in ("create_skill", "edit_skill"):
-                    r = await loop.run_in_executor(None, lambda: skill_engine.create_and_test_skill(s_name or "custom_task", code))
+                    r = await loop.run_in_executor(
+                        None,
+                        lambda: skill_engine.create_and_test_skill(
+                            s_name or "custom_task",
+                            code,
+                            extra_packages=list(extra_pkgs) if extra_pkgs else None,
+                        ),
+                    )
+                    result = str(r)
+                elif action == "test_skill":
+                    r = await loop.run_in_executor(None, lambda: skill_engine.test_skill(s_name))
+                    result = str(r)
+                elif action == "install_deps":
+                    r = await loop.run_in_executor(
+                        None, lambda: skill_engine.install_deps(list(extra_pkgs), skill_name=s_name)
+                    )
+                    result = str(r)
+                elif action == "run_command":
+                    cmd = args.get("command") or ""
+                    r = await loop.run_in_executor(None, lambda: skill_engine.run_command(cmd))
+                    result = str(r)
+                elif action == "skill_info":
+                    r = await loop.run_in_executor(None, lambda: skill_engine.skill_info(s_name))
                     result = str(r)
                 elif action == "delete_skill":
                     r = await loop.run_in_executor(None, lambda: skill_engine.delete_skill(s_name))
@@ -1288,13 +1463,36 @@ class TitanLive:
                     if not isinstance(kw, dict):
                         kw = {}
                     for k, v in args.items():
-                        if k not in ("action", "skill_name", "function_name", "kwargs", "name"):
+                        if k not in (
+                            "action", "skill_name", "function_name", "kwargs", "name",
+                            "python_code", "packages", "command",
+                        ):
                             kw.setdefault(k, v)
                     r = await loop.run_in_executor(None, lambda: skill_engine.execute_skill(s_name, f_name, **kw))
                     result = str(r)
                 else:
-                    skills_list = skill_engine.list_skills()
-                    result = f"Available custom skills: {skills_list}" if skills_list else "No custom skills created yet."
+                    try:
+                        skills_list = skill_engine.list_skills_detailed()
+                    except Exception:
+                        skills_list = skill_engine.list_skills()
+                    result = (
+                        f"Available custom skills: {skills_list}"
+                        if skills_list else
+                        "No custom skills created yet. Use create_skill to invent one."
+                    )
+
+            elif name == "get_clock":
+                result = get_live_clock()
+
+            elif name == "work_pad":
+                r = await loop.run_in_executor(None, lambda: run_work_pad(args))
+                result = str(r)
+                try:
+                    md = (r or {}).get("markdown") if isinstance(r, dict) else None
+                    if md:
+                        self.ui.show_content("WORK PAD", md)
+                except Exception:
+                    pass
 
             elif name == "deep_think":
                 task = args.get("task", "").strip()
@@ -1371,8 +1569,17 @@ class TitanLive:
                         )
                     )
                 elif kind == "end":
+                    # ESC / interrupt must NOT trigger a new Gemini reply
+                    if self._drop_model_audio or self._interrupted:
+                        print("[TITAN] 📡 skip audio_stream_end (interrupted)")
+                        continue
+                    now = time.monotonic()
+                    if (now - self._last_stream_end) < _END_DEBOUNCE_S:
+                        print("[TITAN] 📡 skip audio_stream_end (debounce)")
+                        continue
                     await session.send_realtime_input(audio_stream_end=True)
-                    self._vad_end_t = time.monotonic()
+                    self._last_stream_end = now
+                    self._vad_end_t = now
                     self._first_audio_logged = False
                     _dbg("SEND", "audio_stream_end (local VAD)")
                     print("[TITAN] 📡 audio_stream_end")
@@ -1387,7 +1594,7 @@ class TitanLive:
             np = None
 
         preroll: deque = deque(maxlen=_VAD_PREROLL)
-        state = {"in_speech": False, "silence": 0}
+        state = {"in_speech": False, "silence": 0, "voiced": 0}
 
         def _rms(indata) -> float:
             if np is None:
@@ -1408,17 +1615,19 @@ class TitanLive:
                 return
 
             rms = _rms(indata)
+            now = time.monotonic()
 
-            # Local "user is talking" clock — do NOT wait for Gemini transcription.
-            # This stops RAM-alerts / proactive from stealing the turn.
             if rms >= _VAD_START_RMS:
-                self._last_user_speech = time.monotonic()
+                self._last_user_speech = now
 
-            # Mute while Titan talks (no AEC — otherwise it interrupts itself).
-            # Also swallow the speaker tail so the last syllable isn't heard as you.
-            if titan_speaking or (time.monotonic() - self._speak_ended_at) < _ECHO_TAIL_S:
+            if (
+                titan_speaking
+                or (now - self._speak_ended_at) < _ECHO_TAIL_S
+                or now < self._vad_suppress_until
+            ):
                 state["in_speech"] = False
                 state["silence"] = 0
+                state["voiced"] = 0
                 preroll.clear()
                 return
 
@@ -1430,6 +1639,10 @@ class TitanLive:
                 if rms >= _VAD_START_RMS:
                     state["in_speech"] = True
                     state["silence"] = 0
+                    state["voiced"] = 1
+                    # New real utterance — allow Gemini audio again
+                    self._interrupted = False
+                    self._drop_model_audio = False
                     _dbg("VAD", f"speech start RMS={rms:.0f}")
                     print(f"[TITAN] 🎤 speech start RMS={rms:.0f}")
                     for p in preroll:
@@ -1437,17 +1650,28 @@ class TitanLive:
                     preroll.clear()
             else:
                 self._qput_audio(packet)
-                if rms < _VAD_HOLD_RMS:
+                if rms >= _VAD_HOLD_RMS:
+                    state["voiced"] = state.get("voiced", 0) + 1
+                    state["silence"] = 0
+                else:
                     state["silence"] += 1
-                    if state["silence"] >= _VAD_END_SILENCE:
+                    if (
+                        state["silence"] >= _VAD_END_SILENCE
+                        and state.get("voiced", 0) >= _VAD_MIN_SPEECH
+                    ):
                         self._qput_audio({"kind": "end"})
                         state["in_speech"] = False
                         state["silence"] = 0
+                        state["voiced"] = 0
                         preroll.clear()
                         _dbg("VAD", "speech end")
                         print("[TITAN] 🎤 speech end")
-                else:
-                    state["silence"] = 0
+                    elif state["silence"] >= _VAD_END_SILENCE:
+                        # Click / echo — not a real utterance
+                        state["in_speech"] = False
+                        state["silence"] = 0
+                        state["voiced"] = 0
+                        preroll.clear()
 
         try:
             with sd.InputStream(
@@ -1473,6 +1697,8 @@ class TitanLive:
                 async for response in self.session.receive():
 
                     if response.data:
+                        if self._drop_model_audio:
+                            continue
                         if self._vad_end_t and not self._first_audio_logged:
                             dt = time.monotonic() - self._vad_end_t
                             print(f"[TITAN] ⚡ first audio in {dt:.2f}s")
@@ -1480,8 +1706,6 @@ class TitanLive:
                             self._vad_end_t = 0.0
                         if self._turn_done_event and self._turn_done_event.is_set():
                             self._turn_done_event.clear()
-                        # Split into ~50 ms chunks so interrupt() stops audio within 50 ms
-                        # (24000 Hz × 2 bytes/sample × 0.05 s = 2400 bytes per slice)
                         _audio_data = response.data
                         _SLICE = 2400
                         for _i in range(0, len(_audio_data), _SLICE):
@@ -1590,6 +1814,7 @@ class TitanLive:
             blocksize=CHUNK_SIZE,
         )
         stream.start()
+        self._play_stream = stream
 
         try:
             while True:
@@ -1608,33 +1833,47 @@ class TitanLive:
                         self._turn_done_event.clear()
                     continue
 
-                if self._interrupted:
+                if self._interrupted or self._drop_model_audio:
+                    # Discard anything still in the play queue
+                    q = self.audio_in_queue
+                    if q:
+                        while True:
+                            try:
+                                q.get_nowait()
+                            except Exception:
+                                break
                     self.set_speaking(False)
                     continue
 
                 self.set_speaking(True)
 
-                # Batch all immediately-available chunks into one write to reduce
-                # thread-pool round-trips (was one asyncio.to_thread per 50ms slice).
-                # Cap at ~200 ms so interrupt() still stops audio within ~200 ms.
+                # ~80 ms batches so ESC stops the speaker quickly
                 batch = bytearray(chunk)
-                while len(batch) < 9600:   # 9600 bytes ≈ 200 ms at 24 kHz / 16-bit mono
+                while len(batch) < 3840:
                     try:
                         batch.extend(self.audio_in_queue.get_nowait())
                     except asyncio.QueueEmpty:
                         break
 
+                if self._interrupted or self._drop_model_audio:
+                    self.set_speaking(False)
+                    continue
+
                 try:
                     await asyncio.to_thread(stream.write, bytes(batch))
                 except (RuntimeError, asyncio.CancelledError):
-                    break   # executor shutting down — exit cleanly
+                    break
         except Exception as e:
             print(f"[TITAN] ❌ Play: {e}")
             raise
         finally:
+            self._play_stream = None
             self.set_speaking(False)
-            stream.stop()
-            stream.close()
+            try:
+                stream.stop()
+                stream.close()
+            except Exception:
+                pass
 
     # ── Morning briefing ────────────────────────────────────────────────────────
 
@@ -2036,6 +2275,10 @@ class TitanLive:
                     self._interrupted          = False
                     self._vad_end_t            = 0.0
                     self._first_audio_logged   = False
+                    self._interrupted          = False
+                    self._drop_model_audio     = False
+                    self._vad_suppress_until   = 0.0
+                    self._last_stream_end      = 0.0
 
                     print("[TITAN] Connected.")
                     self.ui.set_state("LISTENING")
