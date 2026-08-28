@@ -1,0 +1,98 @@
+#!/bin/bash
+#
+# skill-sync - Sync skills from GitHub
+#
+# Pulls the latest skills from the central GitHub repository and updates
+# the local cache. Shows what changed and updates version tracking.
+#
+
+set -e
+
+SKILLS_DIR="/home/ubuntu/skills"
+
+echo "🔄 Syncing Manus Skill Arsenal..."
+echo
+
+# Check if installed
+if [ ! -d "$SKILLS_DIR/.git" ]; then
+    echo "❌ Skills not installed"
+    echo "   Run 'skill-install' first"
+    exit 1
+fi
+
+cd "$SKILLS_DIR" || exit 1
+
+# Get current version
+OLD_COMMIT=$(git rev-parse HEAD)
+OLD_COMMIT_SHORT="${OLD_COMMIT:0:12}"
+
+# Fetch latest
+echo "📡 Checking for updates..."
+git fetch origin main --quiet
+
+# Check for updates
+REMOTE_COMMIT=$(git rev-parse origin/main)
+REMOTE_COMMIT_SHORT="${REMOTE_COMMIT:0:12}"
+
+if [ "$OLD_COMMIT" = "$REMOTE_COMMIT" ]; then
+    echo "✅ Already up to date (version: $OLD_COMMIT_SHORT)"
+    echo
+    skill-status
+    exit 0
+fi
+
+# Show what's new
+echo
+echo "📦 Updates available:"
+echo
+git log --oneline --decorate --color=always "$OLD_COMMIT..origin/main" | head -10
+echo
+
+# Count new/modified files
+NEW_FILES=$(git diff --name-status "$OLD_COMMIT..origin/main" | grep -c "^A" || true)
+MODIFIED_FILES=$(git diff --name-status "$OLD_COMMIT..origin/main" | grep -c "^M" || true)
+DELETED_FILES=$(git diff --name-status "$OLD_COMMIT..origin/main" | grep -c "^D" || true)
+
+echo "Changes:"
+[ "$NEW_FILES" -gt 0 ] && echo "  ✨ $NEW_FILES new files"
+[ "$MODIFIED_FILES" -gt 0 ] && echo "  📝 $MODIFIED_FILES modified files"
+[ "$DELETED_FILES" -gt 0 ] && echo "  🗑️  $DELETED_FILES deleted files"
+echo
+
+# Pull changes
+echo "⬇️  Downloading updates..."
+if git pull origin main --quiet; then
+    echo "✅ Synced successfully"
+else
+    echo "❌ Sync failed"
+    echo "   Try: cd $SKILLS_DIR && git pull origin main"
+    exit 1
+fi
+
+# Update version file
+NEW_COMMIT=$(git rev-parse HEAD)
+NEW_COMMIT_SHORT="${NEW_COMMIT:0:12}"
+COMMIT_DATE=$(git log -1 --format=%cd --date=short)
+SKILL_COUNT=$(find skills/ -mindepth 2 -maxdepth 2 -type d 2>/dev/null | wc -l)
+CATEGORY_COUNT=$(find skills/ -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)
+
+cat > .skill-sync-version << EOF
+{
+  "version": "$NEW_COMMIT_SHORT",
+  "commit_hash": "$NEW_COMMIT",
+  "last_sync": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "skills_count": $SKILL_COUNT,
+  "categories_count": $CATEGORY_COUNT,
+  "remote_url": "https://github.com/abcnuts/manus-skills"
+}
+EOF
+
+echo
+echo "📊 Update Summary:"
+echo "   Old version: $OLD_COMMIT_SHORT"
+echo "   New version: $NEW_COMMIT_SHORT"
+echo "   Date: $COMMIT_DATE"
+echo "   Skills: $SKILL_COUNT"
+echo
+echo "🎯 Skills updated!"
+echo

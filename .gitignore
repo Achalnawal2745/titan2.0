@@ -82,10 +82,14 @@ Thumbs.db
 *.webp
 *.wav
 *.mp3
-!face.png
+face.png
 !config/titan.png
+!config/titan_v2.ico
 !config/titan_v3.ico
 !config/titan.ico
+
+# ── Memory Templates ────────────────────────────────────────────────────────
+!memory/*.example.json
 
 # ── IDEs & Editors ──────────────────────────────────────────────────────────
 .idea/

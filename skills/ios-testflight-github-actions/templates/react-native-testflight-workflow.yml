@@ -1,0 +1,100 @@
+name: Deploy to TestFlight (React Native)
+
+on:
+  # Manual trigger - recommended for initial setup
+  workflow_dispatch:
+  
+  # Uncomment to trigger on tags (e.g., v1.0.0)
+  # push:
+  #   tags:
+  #     - 'v*'
+  
+  # Uncomment to trigger on push to main branch
+  # push:
+  #   branches:
+  #     - main
+
+jobs:
+  deploy-ios:
+    name: Build and Deploy iOS to TestFlight
+    runs-on: macos-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+      
+      - name: Setup Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.2'
+          bundler-cache: true
+      
+      - name: Setup Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '15.2'
+      
+      - name: Install dependencies
+        run: npm ci
+      
+      - name: Install CocoaPods
+        run: |
+          cd ios
+          pod install
+      
+      - name: Bundle JavaScript
+        run: |
+          npx react-native bundle \
+            --platform ios \
+            --dev false \
+            --entry-file index.js \
+            --bundle-output ios/main.jsbundle \
+            --assets-dest ios
+      
+      - name: Build and Archive
+        run: |
+          xcodebuild archive \
+            -workspace ios/YourApp.xcworkspace \
+            -scheme YourApp \
+            -configuration Release \
+            -archivePath build/YourApp.xcarchive \
+            -allowProvisioningUpdates \
+            CODE_SIGN_IDENTITY="Apple Distribution" \
+            PROVISIONING_PROFILE_SPECIFIER="YourApp AppStore"
+      
+      - name: Export .ipa
+        run: |
+          xcodebuild -exportArchive \
+            -archivePath build/YourApp.xcarchive \
+            -exportPath build \
+            -exportOptionsPlist ios/ExportOptions.plist \
+            -allowProvisioningUpdates
+          
+          # Rename to app.ipa for consistency
+          mv build/YourApp.ipa build/app.ipa
+          ls -lh build/app.ipa
+      
+      - name: Upload to TestFlight
+        uses: apple-actions/upload-testflight-build@v3
+        with:
+          app-path: build/app.ipa
+          issuer-id: ${{ secrets.APPSTORE_ISSUER_ID }}
+          api-key-id: ${{ secrets.APPSTORE_API_KEY_ID }}
+          api-private-key: ${{ secrets.APPSTORE_API_PRIVATE_KEY }}
+      
+      - name: Notify success
+        if: success()
+        run: |
+          echo "✅ Build successfully uploaded to TestFlight!"
+          echo "Check App Store Connect for processing status."
+      
+      - name: Notify failure
+        if: failure()
+        run: |
+          echo "❌ Deployment failed. Check the logs above for details."

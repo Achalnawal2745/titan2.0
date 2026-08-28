@@ -222,6 +222,22 @@ def shadow_link_control(parameters: dict = None) -> str:
     except RuntimeError:
         res = asyncio.run(_send_chrome_command(action, payload))
 
+    if isinstance(res, dict) and res.get("unsupported"):
+        return (
+            "[Shadow-Link Chrome] ⚠️ "
+            f"{res['unsupported']} URL: {res.get('url') or '(hidden by Chrome)'}"
+        )
+    if (
+        isinstance(res, dict)
+        and not res.get("url")
+        and not res.get("title")
+        and not res.get("interactive_elements")
+    ):
+        return (
+            "[Shadow-Link Chrome] ⚠️ The active tab returned no readable page content. "
+            "It is probably Chrome's built-in PDF viewer or a restricted Chrome page. "
+            "Use smart_task summarize_document or file_processor for the PDF instead."
+        )
     if isinstance(res, dict) and "error" in res:
         return f"[Shadow-Link Chrome] ⚠️ {res['error']}"
     return f"[Shadow-Link Chrome] ✅ Result: {json.dumps(res, ensure_ascii=False)[:300]}"

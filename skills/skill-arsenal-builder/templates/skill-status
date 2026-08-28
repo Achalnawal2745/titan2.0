@@ -1,0 +1,84 @@
+#!/bin/bash
+#
+# skill-status - Show current skill arsenal status
+#
+# Displays information about the local skill installation including
+# version, skill count, last sync time, and repository status.
+#
+
+set -e
+
+SKILLS_DIR="/home/ubuntu/skills"
+
+# Check if installed
+if [ ! -d "$SKILLS_DIR/.git" ]; then
+    echo "❌ Skills not installed"
+    echo "   Run 'skill-install' to set up the skill arsenal"
+    exit 1
+fi
+
+cd "$SKILLS_DIR" || exit 1
+
+# Get version info
+COMMIT_HASH=$(git rev-parse HEAD)
+COMMIT_SHORT="${COMMIT_HASH:0:12}"
+COMMIT_DATE=$(git log -1 --format=%cd --date=short)
+COMMIT_TIME=$(git log -1 --format=%cd --date=relative)
+
+# Count skills
+SKILL_COUNT=$(find skills/ -mindepth 2 -maxdepth 2 -type d 2>/dev/null | wc -l)
+CATEGORY_COUNT=$(find skills/ -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)
+META_SKILL_COUNT=$(find meta-skills/ -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)
+
+# Get last sync time
+if [ -f ".skill-sync-version" ]; then
+    LAST_SYNC=$(grep -o '"last_sync": "[^"]*"' .skill-sync-version | cut -d'"' -f4)
+    LAST_SYNC_RELATIVE=$(date -d "$LAST_SYNC" "+%Y-%m-%d %H:%M" 2>/dev/null || echo "$LAST_SYNC")
+else
+    LAST_SYNC_RELATIVE="Unknown"
+fi
+
+# Check if up to date
+git fetch origin main --quiet 2>/dev/null || true
+LOCAL_COMMIT=$(git rev-parse HEAD)
+REMOTE_COMMIT=$(git rev-parse origin/main 2>/dev/null || echo "$LOCAL_COMMIT")
+
+if [ "$LOCAL_COMMIT" = "$REMOTE_COMMIT" ]; then
+    STATUS="✅ Up to date"
+else
+    COMMITS_BEHIND=$(git rev-list --count HEAD..origin/main 2>/dev/null || echo "?")
+    STATUS="⚠️  $COMMITS_BEHIND updates available"
+fi
+
+# Display status
+echo "╔════════════════════════════════════════════════════════════╗"
+echo "║           Manus Skill Arsenal Status                      ║"
+echo "╚════════════════════════════════════════════════════════════╝"
+echo
+echo "Repository:    https://github.com/abcnuts/manus-skills"
+echo "Local Path:    $SKILLS_DIR"
+echo "Version:       $COMMIT_SHORT ($COMMIT_DATE)"
+echo "Last Sync:     $LAST_SYNC_RELATIVE"
+echo
+echo "Skills:        $SKILL_COUNT"
+echo "Categories:    $CATEGORY_COUNT"
+echo "Meta-Skills:   $META_SKILL_COUNT"
+echo
+echo "Status:        $STATUS"
+echo
+
+# Show categories
+echo "Categories:"
+for category in $(find skills/ -mindepth 1 -maxdepth 1 -type d | sort); do
+    category_name=$(basename "$category")
+    skill_count=$(find "$category" -mindepth 1 -maxdepth 1 -type d | wc -l)
+    printf "  %-25s %2d skills\n" "$category_name" "$skill_count"
+done
+echo
+
+# Show commands
+echo "Commands:"
+echo "  skill-sync     Pull latest skills from GitHub"
+echo "  skill-check    Check for updates without downloading"
+echo "  skill-status   Show this status (you are here)"
+echo

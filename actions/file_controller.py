@@ -1,4 +1,5 @@
 import os
+import re
 import shutil
 import platform
 from pathlib import Path
@@ -11,6 +12,61 @@ except ImportError:
     _SEND2TRASH = False
 
 _OS = platform.system()  # "Windows" | "Darwin" | "Linux"
+
+# On Windows, Downloads/Desktop/Documents/Pictures/Music/Videos are often
+# redirected — moved to another drive, or moved into OneDrive by "Known
+# Folder Move". Blindly assuming home()/"Downloads" silently looks in the
+# WRONG place whenever that's true, which is exactly why "find X in
+# Downloads" was failing even though the file was really there.
+# We read the actual location from the registry, and only fall back to
+# home()/name if that lookup fails (non-Windows, or nothing redirected).
+_SHELL_FOLDER_GUIDS = {
+    "Desktop":   "{B4BFCC3A-DB2C-424C-B029-7FE99A87C641}",
+    "Downloads": "{374DE290-123F-4565-9164-39C4925E467B}",
+    "Documents": "{FDD39AD0-238F-46AF-ADB4-6C85480369C7}",
+    "Pictures":  "{33E28130-4E1E-4676-835A-98395C3BC3BB}",
+    "Music":     "{4BD8D571-6D19-48D3-BE97-422220080E43}",
+    "Videos":    "{18989B1D-99B5-455B-841C-AB7C74E4DDFC}",
+}
+_shell_folder_cache: dict[str, Path] = {}
+
+def _windows_shell_folder(name: str) -> "Path | None":
+    """Read the ACTUAL folder path from the registry (handles redirection
+    to another drive or OneDrive) instead of assuming it lives under home()."""
+    if _OS != "Windows":
+        return None
+    if name in _shell_folder_cache:
+        return _shell_folder_cache[name]
+    guid = _SHELL_FOLDER_GUIDS.get(name)
+    try:
+        import winreg
+        for key_name in ("User Shell Folders", "Shell Folders"):
+            try:
+                with winreg.OpenKey(
+                    winreg.HKEY_CURRENT_USER,
+                    rf"Software\Microsoft\Windows\CurrentVersion\Explorer\{key_name}",
+                ) as key:
+                    val = None
+                    if guid:
+                        try:
+                            val, _ = winreg.QueryValueEx(key, guid)
+                        except FileNotFoundError:
+                            pass
+                    if val is None:
+                        try:
+                            val, _ = winreg.QueryValueEx(key, name)
+                        except FileNotFoundError:
+                            val = None
+                    if val:
+                        p = Path(os.path.expandvars(val))
+                        if p.exists():
+                            _shell_folder_cache[name] = p
+                            return p
+            except FileNotFoundError:
+                continue
+    except Exception:
+        pass
+    return None
 
 _SAFE_ROOTS: list[Path] = [
     Path.home(),
@@ -33,6 +89,10 @@ def _is_safe_path(target: Path) -> bool:
         return False
 
 def _get_desktop() -> Path:
+    if _OS == "Windows":
+        p = _windows_shell_folder("Desktop")
+        if p:
+            return p
     if _OS == "Linux":
         xdg = os.environ.get("XDG_DESKTOP_DIR", "")
         if xdg and Path(xdg).exists():
@@ -40,6 +100,10 @@ def _get_desktop() -> Path:
     return Path.home() / "Desktop"
 
 def _get_downloads() -> Path:
+    if _OS == "Windows":
+        p = _windows_shell_folder("Downloads")
+        if p:
+            return p
     if _OS == "Linux":
         xdg = os.environ.get("XDG_DOWNLOAD_DIR", "")
         if xdg and Path(xdg).exists():
@@ -47,6 +111,10 @@ def _get_downloads() -> Path:
     return Path.home() / "Downloads"
 
 def _get_documents() -> Path:
+    if _OS == "Windows":
+        p = _windows_shell_folder("Documents")
+        if p:
+            return p
     if _OS == "Linux":
         xdg = os.environ.get("XDG_DOCUMENTS_DIR", "")
         if xdg and Path(xdg).exists():
@@ -54,6 +122,10 @@ def _get_documents() -> Path:
     return Path.home() / "Documents"
 
 def _get_pictures() -> Path:
+    if _OS == "Windows":
+        p = _windows_shell_folder("Pictures")
+        if p:
+            return p
     if _OS == "Linux":
         xdg = os.environ.get("XDG_PICTURES_DIR", "")
         if xdg and Path(xdg).exists():
@@ -61,6 +133,10 @@ def _get_pictures() -> Path:
     return Path.home() / "Pictures"
 
 def _get_music() -> Path:
+    if _OS == "Windows":
+        p = _windows_shell_folder("Music")
+        if p:
+            return p
     if _OS == "Linux":
         xdg = os.environ.get("XDG_MUSIC_DIR", "")
         if xdg and Path(xdg).exists():
@@ -68,6 +144,10 @@ def _get_music() -> Path:
     return Path.home() / "Music"
 
 def _get_videos() -> Path:
+    if _OS == "Windows":
+        p = _windows_shell_folder("Videos")
+        if p:
+            return p
     if _OS == "Linux":
         xdg = os.environ.get("XDG_VIDEOS_DIR", "")
         if xdg and Path(xdg).exists():
@@ -76,6 +156,17 @@ def _get_videos() -> Path:
 
 
 def _resolve_path(raw: str) -> Path:
+    if not raw or not raw.strip():
+        return _get_desktop()
+
+    raw_clean = raw.strip().strip("'\"").replace("\\", "/")
+    lower = raw_clean.lower().strip()
+
+    # Handle drive letters and aliases (e.g. "e:", "e:/", "e drive", "drive e")
+    for d in "abcdefghijklmnopqrstuvwxyz":
+        if lower in (f"{d}:", f"{d}:/", f"{d} drive", f"drive {d}", f"drive {d}:"):
+            return Path(f"{d.upper()}:/")
+
     shortcuts: dict[str, Path] = {
         "desktop":   _get_desktop(),
         "downloads": _get_downloads(),
@@ -85,8 +176,6 @@ def _resolve_path(raw: str) -> Path:
         "videos":    _get_videos(),
         "home":      Path.home(),
     }
-    raw_clean = raw.strip().replace("\\", "/")
-    lower = raw_clean.lower()
     if lower in shortcuts:
         return shortcuts[lower]
 
@@ -95,7 +184,7 @@ def _resolve_path(raw: str) -> Path:
             remainder = raw_clean[len(key) + 1:]
             return path_obj / remainder
 
-    return Path(raw).expanduser()
+    return Path(raw_clean).expanduser()
 
 def _format_size(b: int) -> str:
     for unit in ["B", "KB", "MB", "GB", "TB"]:
@@ -104,8 +193,23 @@ def _format_size(b: int) -> str:
         b /= 1024
     return f"{b:.1f} TB"
 
-def _safe_trash(target: Path) -> str:
+def list_drives() -> str:
+    if _OS == "Windows":
+        drives = []
+        for d in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
+            p = Path(f"{d}:/")
+            if p.exists():
+                try:
+                    usage = shutil.disk_usage(p)
+                    free = _format_size(usage.free)
+                    total = _format_size(usage.total)
+                    drives.append(f"💾 Drive {d}:/ (Free: {free} / Total: {total})")
+                except Exception:
+                    drives.append(f"💾 Drive {d}:/")
+        return "Connected Disks & Drives:\n" + "\n".join(drives) if drives else "No drives detected."
+    return "Root filesystem: /"
 
+def _safe_trash(target: Path) -> str:
     if not _SEND2TRASH:
         return (
             "send2trash is not installed. "
@@ -118,6 +222,10 @@ def _safe_trash(target: Path) -> str:
 
 def list_files(path: str = "desktop", show_hidden: bool = False) -> str:
     try:
+        raw_lower = (path or "").strip().lower()
+        if raw_lower in ("drives", "all drives", "my computer", "this pc", "disks", "disk"):
+            return list_drives()
+
         target = _resolve_path(path)
         if not _is_safe_path(target):
             return f"Access denied: {target}"
@@ -136,10 +244,11 @@ def list_files(path: str = "desktop", show_hidden: bool = False) -> str:
                 size = _format_size(item.stat().st_size)
                 items.append(f"📄 {item.name} ({size})")
 
+        display_name = target.name or str(target)
         if not items:
-            return f"Directory is empty: {target.name}/"
+            return f"Directory is empty: {display_name}"
 
-        return f"Contents of {target.name}/ ({len(items)} items):\n" + "\n".join(items)
+        return f"Contents of {display_name} ({len(items)} items):\n" + "\n".join(items)
 
     except PermissionError:
         return f"Permission denied: {path}"
@@ -287,7 +396,58 @@ def read_file(path: str, name: str = "", max_chars: int = 4000) -> str:
         if not target.is_file():
             return f"Not a file: {target.name}"
 
-        content = target.read_text(encoding="utf-8", errors="ignore")
+        ext = target.suffix.lower()
+        if ext == ".pdf":
+            try:
+                import pypdf
+                reader = pypdf.PdfReader(str(target))
+                pages_text = [page.extract_text() or "" for page in reader.pages]
+                content = "\n\n".join(t.strip() for t in pages_text if t.strip())
+                if not content:
+                    import pdfplumber
+                    with pdfplumber.open(str(target)) as pdf:
+                        content = "\n\n".join((p.extract_text() or "").strip() for p in pdf.pages if (p.extract_text() or "").strip())
+            except Exception:
+                try:
+                    import pdfplumber
+                    with pdfplumber.open(str(target)) as pdf:
+                        content = "\n\n".join((p.extract_text() or "").strip() for p in pdf.pages if (p.extract_text() or "").strip())
+                except Exception as e:
+                    content = f"[PDF text extraction failed: {e}]"
+
+        elif ext in (".docx", ".doc"):
+            try:
+                from docx import Document
+                doc = Document(str(target))
+                content = "\n".join(p.text for p in doc.paragraphs if p.text.strip())
+            except Exception:
+                # OLE2 .doc or corrupted docx text extraction
+                try:
+                    raw_bytes = target.read_bytes()
+                    words = [s.decode("utf-8", "ignore") for s in re.findall(rb"[\x20-\x7e\n\r\t]{4,}", raw_bytes)]
+                    content = " ".join(words)
+                except Exception as e:
+                    content = f"[Document text extraction failed: {e}]"
+
+        elif ext in (".pptx", ".ppt"):
+            try:
+                from pptx import Presentation
+                prs = Presentation(str(target))
+                slides = []
+                for i, slide in enumerate(prs.slides, 1):
+                    txts = [shape.text.strip() for shape in slide.shapes if hasattr(shape, "text") and shape.text.strip()]
+                    if txts:
+                        slides.append(f"--- Slide {i} ---\n" + "\n".join(txts))
+                content = "\n\n".join(slides)
+            except Exception as e:
+                content = f"[Presentation text extraction failed: {e}]"
+
+        else:
+            content = target.read_text(encoding="utf-8", errors="ignore")
+
+        if not content.strip():
+            return f"[File '{target.name}' is empty or contains non-extractable media]"
+
         if len(content) > max_chars:
             content = content[:max_chars] + f"\n\n[Truncated — {len(content)} total chars]"
         return content
@@ -306,18 +466,6 @@ def write_file(path: str, name: str = "", content: str = "",
         target.parent.mkdir(parents=True, exist_ok=True)
 
         # ── Word (.docx) safe writer fix ───────────────────────────────────────
-        if target.suffix.lower() in (".docx", ".doc"):
-            try:
-                import sys
-                from pathlib import Path
-                root_dir = Path(__file__).resolve().parent.parent
-                if str(root_dir) not in sys.path:
-                    sys.path.insert(0, str(root_dir))
-                import doc_engine
-                return doc_engine.create_word_from_markdown(str(target), content, open_after=True)
-            except Exception as doc_err:
-                print(f"[file_controller] doc_engine write fallback: {doc_err}")
-
         mode = "a" if append else "w"
         with open(target, mode, encoding="utf-8") as f:
             f.write(content)
@@ -501,45 +649,73 @@ def file_controller(
 ) -> str:
     params = parameters or {}
     action = params.get("action", "").lower().strip()
-    path   = params.get("path", "desktop")
-    name   = params.get("name", "")
+    path   = (
+        params.get("file_path")
+        or params.get("filepath")
+        or params.get("path")
+        or params.get("target")
+        or params.get("folder")
+        or params.get("directory")
+        or "desktop"
+    )
+    name   = (
+        params.get("name")
+        or params.get("filename")
+        or params.get("file_name")
+        or ""
+    )
+    dest   = (
+        params.get("destination")
+        or params.get("dest")
+        or params.get("to")
+        or ""
+    )
+    n_name = (
+        params.get("new_name")
+        or params.get("newname")
+        or params.get("target_name")
+        or ""
+    )
 
     if player:
         player.write_log(f"[file] {action} {name or path}")
 
     try:
-        if action == "list":
+        if action in ("list", "list_files", "ls", "dir"):
             return list_files(path)
 
-        elif action == "create_file":
+        elif action in ("drives", "list_drives"):
+            return list_drives()
+
+        elif action in ("create_file", "touch"):
             return create_file(path, name=name, content=params.get("content", ""))
 
-        elif action == "create_folder":
+        elif action in ("create_folder", "mkdir"):
             return create_folder(path, name=name)
 
-        elif action == "delete":
+        elif action in ("delete", "remove", "rm"):
             return delete_file(path, name=name)
 
-        elif action == "move":
-            return move_file(path, name=name, destination=params.get("destination", ""))
+        elif action in ("move", "mv"):
+            return move_file(path, name=name, destination=dest)
 
-        elif action == "copy":
-            return copy_file(path, name=name, destination=params.get("destination", ""))
+        elif action in ("copy", "cp"):
+            return copy_file(path, name=name, destination=dest)
 
-        elif action == "rename":
-            return rename_file(path, name=name, new_name=params.get("new_name", ""))
+        elif action in ("rename", "ren"):
+            return rename_file(path, name=name, new_name=n_name)
 
-        elif action == "read":
+        elif action in ("read", "read_file", "view", "cat"):
             return read_file(path, name=name)
 
-        elif action == "write":
+        elif action in ("write", "write_file"):
             return write_file(
                 path, name=name,
                 content=params.get("content", ""),
                 append=params.get("append", False)
             )
 
-        elif action == "find":
+        elif action in ("find", "search"):
             return find_files(
                 name=name or params.get("name", ""),
                 extension=params.get("extension", ""),
@@ -559,7 +735,7 @@ def file_controller(
         elif action == "organize_desktop":
             return organize_desktop()
 
-        elif action == "info":
+        elif action in ("info", "stat", "status"):
             return get_file_info(path, name=name)
 
         else:

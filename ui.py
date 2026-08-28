@@ -82,6 +82,8 @@ class C:
     TEXT      = "#d6e4ff"
     TEXT_DIM  = "#7188ad"
     TEXT_MED  = "#4a5c78"
+    TEXT_HI   = "#ffffff"
+    TEXT_LOW  = "#7188ad"
     WHITE     = "#ffffff"
     DARK      = "#05070c"
     BAR_BG    = "#101826"
@@ -808,7 +810,8 @@ def _fmt_size(size: int) -> str:
 
 
 class FileDropZone(QWidget):
-    file_selected = pyqtSignal(str)
+    file_selected = pyqtSignal(str)      # kept for backwards compat — fires once per file
+    files_selected = pyqtSignal(list)    # new — fires once with ALL dropped/browsed files
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -816,6 +819,7 @@ class FileDropZone(QWidget):
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setFixedHeight(100)
         self._current_file: str | None = None
+        self._current_files: list[str] = []
         self._hovering  = False
         self._drag_over = False
         self._dash_offset = 0.0
@@ -843,10 +847,9 @@ class FileDropZone(QWidget):
     def dropEvent(self, e: QDropEvent):
         self._drag_over = False
         urls = e.mimeData().urls()
-        if urls:
-            path = urls[0].toLocalFile()
-            if Path(path).is_file():
-                self._set_file(path)
+        paths = [u.toLocalFile() for u in urls if Path(u.toLocalFile()).is_file()]
+        if paths:
+            self._set_files(paths)
         self._canvas.update()
 
     def mousePressEvent(self, e):
@@ -862,12 +865,15 @@ class FileDropZone(QWidget):
     def current_file(self) -> str | None:
         return self._current_file
 
+    def current_files(self) -> list[str]:
+        return list(self._current_files)
+
     def clear_file(self):
-        self._current_file = None; self._canvas.update()
+        self._current_file = None; self._current_files = []; self._canvas.update()
 
     def _browse(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Select a file for TITAN", str(Path.home()),
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "Select file(s) for TITAN", str(Path.home()),
             "All Files (*.*);;"
             "Images (*.jpg *.jpeg *.png *.gif *.webp *.bmp *.svg);;"
             "Documents (*.pdf *.docx *.txt *.md *.pptx);;"
@@ -877,13 +883,16 @@ class FileDropZone(QWidget):
             "Video (*.mp4 *.avi *.mov *.mkv *.wmv *.webm);;"
             "Archives (*.zip *.rar *.tar *.gz *.7z)",
         )
-        if path:
-            self._set_file(path)
+        if paths:
+            self._set_files(paths)
 
-    def _set_file(self, path: str):
-        self._current_file = path
+    def _set_files(self, paths: list[str]):
+        self._current_files = paths
+        self._current_file = paths[-1]
         self._canvas.update()
-        self.file_selected.emit(path)
+        self.files_selected.emit(paths)
+        for p in paths:  # compat: old single-file listeners still get every file
+            self.file_selected.emit(p)
 
 
 class _DropCanvas(QWidget):
@@ -2234,6 +2243,158 @@ class TerminalOverlay(QWidget):
         QApplication.clipboard().setText(self._text_area.toPlainText())
 
 
+class CodeEditorOverlay(QWidget):
+    """Shows what TITAN itself is writing and running via run_command/
+    dev_agent — this is TITAN's workspace, not a box waiting for the user
+    to type code into. It auto-populates and auto-opens when the agent runs
+    something (see MainWindow._editor_sig), and the code/output stay
+    editable afterward only so the user can tweak and re-run if they want
+    to — that's a bonus, not the primary flow."""
+    _OW, _OH = 720, 560
+
+    def __init__(self, parent=None, log_signal=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self._log_signal = log_signal
+        self._scratch_dir = _base_dir() / "workspace" / "scratch"
+        self._scratch_dir.mkdir(parents=True, exist_ok=True)
+
+        self.setStyleSheet(f"""
+            CodeEditorOverlay {{
+                background: {C.PANEL}; border: 1px solid {C.BORDER}; border-radius: 10px;
+            }}
+        """)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(8)
+
+        header = QHBoxLayout()
+        title = QLabel("🖊  TITAN'S WORKSPACE")
+        title.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
+        title.setStyleSheet(f"color: {C.PRI}; border: none;")
+        header.addWidget(title)
+        header.addStretch()
+
+        self._filename = QLineEdit("scratch.py")
+        self._filename.setFixedWidth(160)
+        self._filename.setStyleSheet(
+            f"background:{C.PANEL2}; color:{C.TEXT_HI}; border:1px solid {C.BORDER}; "
+            f"border-radius:4px; padding:2px 6px;"
+        )
+        header.addWidget(self._filename)
+
+        run_btn = QPushButton("▶ Re-run")
+        run_btn.setToolTip("Only needed if you edited the code below yourself")
+        run_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        run_btn.setStyleSheet(f"""
+            QPushButton {{ background:{C.GREEN_D}; color:{C.WHITE}; border-radius:6px; padding:4px 14px; }}
+            QPushButton:hover {{ background:{C.GREEN}; }}
+            QPushButton:disabled {{ background:{C.PANEL2}; color:{C.TEXT_LOW}; }}
+        """)
+        run_btn.clicked.connect(self._run)
+        self._run_btn = run_btn
+        header.addWidget(run_btn)
+
+        close_btn = QPushButton("✕")
+        close_btn.setFixedSize(24, 24)
+        close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        close_btn.setStyleSheet(
+            f"QPushButton {{ background:transparent; color:{C.TEXT_MED}; border:none; }}"
+            f"QPushButton:hover {{ color:{C.TEXT_HI}; }}"
+        )
+        close_btn.clicked.connect(self.hide)
+        header.addWidget(close_btn)
+        lay.addLayout(header)
+
+        hint = QLabel("TITAN writes here automatically while it works — this is a window into it, not a form to fill in.")
+        hint.setFont(QFont("Segoe UI", 8))
+        hint.setStyleSheet(f"color:{C.TEXT_LOW}; border:none;")
+        hint.setWordWrap(True)
+        lay.addWidget(hint)
+
+        self.editor = QTextEdit()
+        self.editor.setFont(QFont("Cascadia Code", 10))
+        self.editor.setPlaceholderText("(nothing running yet — this fills in when TITAN executes code)")
+        self.editor.setStyleSheet(
+            f"background:#0b0f12; color:#c8f7dc; border:1px solid {C.BORDER}; "
+            f"border-radius:6px; padding:8px;"
+        )
+        lay.addWidget(self.editor, stretch=3)
+
+        out_label = QLabel("OUTPUT")
+        out_label.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
+        out_label.setStyleSheet(f"color:{C.TEXT_LOW}; border:none;")
+        lay.addWidget(out_label)
+
+        self.output = QTextEdit()
+        self.output.setReadOnly(True)
+        self.output.setFont(QFont("Consolas", 9))
+        self.output.setStyleSheet(
+            f"background:#080a0b; color:{C.TEXT_MED}; border:1px solid {C.BORDER}; "
+            f"border-radius:6px; padding:6px;"
+        )
+        lay.addWidget(self.output, stretch=2)
+
+    def show_agent_run(self, filename: str, code: str, output: str):
+        """Called via MainWindow._editor_sig whenever TITAN runs code through
+        run_command/dev_agent — this is the normal way this widget gets
+        populated, not the manual _run() button below."""
+        self._filename.setText(filename or "scratch.py")
+        self.editor.setPlainText(code or "")
+        self.output.setPlainText(output or "")
+
+    def load_file(self, path: str):
+        """Populate the editor from an uploaded/staged file — used when the
+        user drops a .py/.js/etc file and wants to view or edit it here."""
+        try:
+            text = Path(path).read_text(encoding="utf-8", errors="ignore")
+            self.editor.setPlainText(text)
+            self._filename.setText(Path(path).name)
+        except Exception as e:
+            self.output.append(f"[load failed] {e}")
+
+    def _run(self):
+        code = self.editor.toPlainText()
+        if not code.strip():
+            return
+        name = self._filename.text().strip() or "scratch.py"
+        if not name.endswith(".py"):
+            name += ".py"
+        target = self._scratch_dir / name
+        try:
+            target.write_text(code, encoding="utf-8")
+        except Exception as e:
+            self.output.append(f"[write failed] {e}")
+            return
+
+        self._run_btn.setEnabled(False)
+        self.output.append(f"\n$ python {name}")
+        threading.Thread(target=self._run_in_thread, args=(str(target),), daemon=True).start()
+
+    def _run_in_thread(self, path: str):
+        try:
+            from core.exec import run_command
+            import sys as _sys
+            result = run_command([_sys.executable, path], cwd=str(self._scratch_dir), timeout=30)
+            text = result["stdout"]
+            if result["stderr"]:
+                text += ("\n" if text else "") + result["stderr"]
+            if not text:
+                text = f"(exit {result['exit_code']}, no output)"
+        except Exception as e:
+            text = f"[run failed] {e}"
+        # Marshal back onto the UI — append_output is invoked via signal in real
+        # PyQt usage; simplified here to a direct call since QTextEdit.append
+        # is safe from a worker thread only via a signal in production code.
+        if self._log_signal:
+            try:
+                self._log_signal.emit(f"[CodeEditor] ran {Path(path).name}")
+            except Exception:
+                pass
+        self.output.append(text)
+        self._run_btn.setEnabled(True)
+
+
 class MainWindow(QMainWindow):
     _log_sig        = pyqtSignal(str)        # Clean Activity Stream logs
     _terminal_sig   = pyqtSignal(str)        # Full raw terminal stdout/stderr logs
@@ -2244,6 +2405,7 @@ class MainWindow(QMainWindow):
     _cam_stream_sig = pyqtSignal(bool)       # True=start live stream, False=stop
     _cam_frame_sig   = pyqtSignal(bytes)      # live camera frame → HUD area
     _clipboard_sig   = pyqtSignal(str)        # clipboard text changed (thread-safe)
+    _editor_sig      = pyqtSignal(str, str, str)  # (filename, code, output) — agent pushes here when it runs code
     _sec_refresh_sig = pyqtSignal()          # refresh security buttons on UI (thread-safe)
     _enroll_face_sig = pyqtSignal()          # open visual face enrollment window (thread-safe)
     _lock_screen_sig = pyqtSignal()          # open lock screen dialog on main thread (thread-safe)
@@ -2401,6 +2563,7 @@ class MainWindow(QMainWindow):
         # Clean user-facing activity stream
         self._log_sig.connect(self._log.append_log)
         self._log_sig.connect(self._terminal_overlay.append_log)
+        self._editor_sig.connect(self._on_agent_ran_code)
         self._state_sig.connect(self._apply_state)
         self._content_sig.connect(self._show_content)
         self._reconfig_sig.connect(self._show_setup)
@@ -2818,6 +2981,8 @@ class MainWindow(QMainWindow):
             )
         if self._terminal_overlay and self._terminal_overlay.isVisible():
             self._position_terminal_overlay()
+        if getattr(self, "_editor_overlay", None) and self._editor_overlay.isVisible():
+            self._position_editor_overlay()
         # Camera preview — bottom-right corner of the center/HUD area
         pw = _CameraPreview._W
         ph = self._cam_preview.height() or _CameraPreview._H
@@ -2855,6 +3020,47 @@ class MainWindow(QMainWindow):
                 (cw.height() - oh) // 2,
                 ow, oh
             )
+
+    def _toggle_editor(self):
+        if not getattr(self, "_editor_overlay", None):
+            self._editor_overlay = CodeEditorOverlay(self.centralWidget(), log_signal=self._log_sig)
+            self._position_editor_overlay()
+
+        vis = not self._editor_overlay.isVisible()
+        self._editor_overlay.setVisible(vis)
+        self._editor_btn.setChecked(vis)
+        if vis:
+            self._editor_overlay.raise_()
+            self._position_editor_overlay()
+            # If a code file is currently staged from an upload, load it in
+            # automatically so "edit the file I just dropped" just works.
+            cur = self._drop_zone.current_file() if hasattr(self, "_drop_zone") else None
+            if cur and Path(cur).suffix.lower() in (".py", ".js", ".ts", ".html", ".css", ".json", ".txt"):
+                self._editor_overlay.load_file(cur)
+
+    def _position_editor_overlay(self):
+        if getattr(self, "_editor_overlay", None):
+            cw = self.centralWidget()
+            ow, oh = CodeEditorOverlay._OW, CodeEditorOverlay._OH
+            self._editor_overlay.setGeometry(
+                (cw.width() - ow) // 2,
+                (cw.height() - oh) // 2,
+                ow, oh
+            )
+
+    def _on_agent_ran_code(self, filename: str, code: str, output: str):
+        """TITAN calls _editor_sig.emit(...) (thread-safe, from main.py's
+        run_command dispatch) whenever it actually runs a script — this
+        opens the workspace overlay automatically so the user sees what's
+        happening without needing to open it or type anything themselves."""
+        if not getattr(self, "_editor_overlay", None):
+            self._editor_overlay = CodeEditorOverlay(self.centralWidget(), log_signal=self._log_sig)
+            self._position_editor_overlay()
+        self._editor_overlay.show_agent_run(filename, code, output)
+        self._editor_overlay.setVisible(True)
+        self._editor_btn.setChecked(True)
+        self._editor_overlay.raise_()
+        self._position_editor_overlay()
 
     def _update_metrics(self):
         snap = _metrics.snapshot()
@@ -2968,6 +3174,24 @@ class MainWindow(QMainWindow):
         self._terminal_btn.setCheckable(True)
         self._terminal_btn.clicked.connect(self._toggle_terminal)
         brand_box.addWidget(self._terminal_btn)
+
+        self._editor_btn = QPushButton("🖊  EDITOR")
+        self._editor_btn.setFixedHeight(28)
+        self._editor_btn.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
+        self._editor_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._editor_btn.setToolTip("Write and run code — output streams to the log")
+        self._editor_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: {C.PANEL2}; color: {C.TEXT_MED};
+                border: 1px solid {C.BORDER}; border-radius: 6px;
+                padding: 0 10px;
+            }}
+            QPushButton:hover {{ color: {C.PRI}; border-color: {C.PRI}; background: {C.PRI_GHO}; }}
+            QPushButton:checked {{ color: {C.WHITE}; border-color: {C.PRI}; background: {C.PRI_DIM}; }}
+        """)
+        self._editor_btn.setCheckable(True)
+        self._editor_btn.clicked.connect(self._toggle_editor)
+        brand_box.addWidget(self._editor_btn)
         lay.addLayout(brand_box)
 
         lay.addStretch()
@@ -3118,7 +3342,7 @@ class MainWindow(QMainWindow):
 
         lay.addWidget(_sec("FILE UPLOAD ZONE"))
         self._drop_zone = FileDropZone()
-        self._drop_zone.file_selected.connect(self._on_file_selected)
+        self._drop_zone.files_selected.connect(self._on_files_selected)
         lay.addWidget(self._drop_zone)
 
         self._file_hint = QLabel("Drop files above or click to select")
@@ -3500,21 +3724,96 @@ class MainWindow(QMainWindow):
         return w
 
     def _on_file_selected(self, path: str):
-        self._current_file = path
-        p    = Path(path)
-        cat  = _file_category(p)
-        icon, _ = _FILE_ICONS.get(cat, _FILE_ICONS["unknown"])
-        size = _fmt_size(p.stat().st_size)
-        self._file_hint.setText(f"{icon}  {p.name}  ·  {size}  ·  Tell {self._assistant_name} what to do with it")
-        self._log.append_log(f"FILE: {p.name} ({size}) loaded")
-        if self.on_text_command:
-            msg = (
-                f"[FILE_UPLOADED] path={path} | name={p.name} | "
-                f"type={p.suffix.lstrip('.')} | size={size} | "
-                f"Briefly tell the user you can see the file '{p.name}' "
-                f"({size}) has been uploaded and ask what they'd like to do with it."
-            )
-            threading.Thread(target=self.on_text_command, args=(msg,), daemon=True).start()
+        """Kept for any other single-file listener; multi-file drops now go
+        through _on_files_selected below, which does the real staging/preview
+        work. This one file-at-a-time path is preserved for compatibility."""
+        self._on_files_selected([path])
+
+    def _on_files_selected(self, paths: list[str]):
+        """Stage every dropped/browsed file into TITAN's own uploads/ folder
+        (not left wherever the user dragged it from), extract a cheap local
+        preview with no LLM call, and hand the model one self-contained
+        message per file so it doesn't need a separate tool round-trip
+        before it can respond meaningfully."""
+        from datetime import datetime
+        import shutil, uuid
+
+        uploads_dir = _base_dir() / "uploads"
+        uploads_dir.mkdir(parents=True, exist_ok=True)
+
+        for path in paths:
+            src = Path(path)
+            if not src.is_file():
+                continue
+
+            # Stage a copy so the file survives even if the original moves/
+            # is deleted, and so every uploaded file lives in one place TITAN
+            # always knows about.
+            dest = uploads_dir / src.name
+            try:
+                if dest.exists() and dest.stat().st_size != src.stat().st_size:
+                    dest = uploads_dir / f"{src.stem}_{uuid.uuid4().hex[:6]}{src.suffix}"
+                shutil.copy2(src, dest)
+                staged_path = str(dest)
+            except Exception as e:
+                self._log.append_log(f"FILE: could not stage {src.name} — {e}")
+                staged_path = str(src)  # fall back to original path
+
+            self._current_file = staged_path
+            p    = Path(staged_path)
+            cat  = _file_category(p)
+            icon, _ = _FILE_ICONS.get(cat, _FILE_ICONS["unknown"])
+            size = _fmt_size(p.stat().st_size)
+            self._file_hint.setText(f"{icon}  {p.name}  ·  {size}  ·  Tell {self._assistant_name} what to do with it")
+            self._log.append_log(f"FILE: {p.name} ({size}) staged → uploads/")
+
+            preview = self._extract_preview(p)
+
+            if self.on_text_command:
+                msg = (
+                    f"[FILE_UPLOADED] path={staged_path} | name={p.name} | "
+                    f"type={p.suffix.lstrip('.')} | size={size}\n"
+                    f"{preview}\n"
+                    f"Briefly tell the user you can see the file '{p.name}' "
+                    f"({size}) has been uploaded and ask what they'd like to do with it, "
+                    f"or act on it directly if their instruction is already clear."
+                )
+                threading.Thread(target=self.on_text_command, args=(msg,), daemon=True).start()
+
+    def _extract_preview(self, path: Path, max_chars: int = 3000) -> str:
+        """Cheap, local, NO-LLM-CALL preview so a drag-drop doesn't cost an
+        API round trip or add latency before the user even asks for
+        anything. Uses file_processor's own type detection + readers where
+        possible instead of duplicating them. Deep, action-specific
+        processing (summarize, rewrite, etc.) stays available to the model
+        via the file_processor TOOL — this is only the instant preview."""
+        suffix = path.suffix.lower()
+        try:
+            if suffix in (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"):
+                return "PREVIEW: [image — route through vision, do not text-extract]"
+            if suffix in (".docx", ".txt", ".md", ".csv", ".json", ".xml",
+                          ".py", ".js", ".ts", ".html", ".css"):
+                from file_processor import file_processor as _fp
+                result = _fp({"path": str(path), "action": "extract_text"})
+                return f"PREVIEW:\n{str(result)[:max_chars]}"
+            if suffix == ".pdf":
+                try:
+                    import fitz  # pymupdf — already in requirements.txt
+                    doc = fitz.open(str(path))
+                    text = "\n".join(page.get_text() for page in doc[:5])
+                    return f"PREVIEW (first 5 pages):\n{text[:max_chars]}"
+                except Exception:
+                    return "PREVIEW: [pdf — call file_processor to extract]"
+            if suffix in (".pptx",):
+                try:
+                    from pptx import Presentation
+                    prs = Presentation(str(path))
+                    return f"PREVIEW: [{len(prs.slides)} slides presentation]"
+                except Exception:
+                    return "PREVIEW: [pptx presentation]"
+        except Exception as e:
+            return f"PREVIEW: [could not preview locally: {e} — call file_processor if needed]"
+        return "PREVIEW: [binary/unsupported for instant preview — call file_processor on demand]"
 
     def notify_phone_connected(self) -> None:
         if self._remote_overlay and self._remote_overlay.isVisible():

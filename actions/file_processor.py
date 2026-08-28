@@ -25,15 +25,13 @@ import tempfile
 from pathlib import Path
 from datetime import datetime
 
-def _get_api_key() -> str:
-    config_path = Path(__file__).resolve().parent.parent / "config" / "api_keys.json"
-    with open(config_path, "r", encoding="utf-8") as f:
-        return json.load(f)["gemini_api_key"]
-
-
 def _gemini_client():
-    from google import genai
-    _c = genai.Client(api_key=_get_api_key())
+    """Thin wrapper preserved for the many `model.generate_content(contents)`
+    call sites in this file; the underlying client now comes from
+    core.llm.get_client() instead of building its own from a re-read config
+    file each call."""
+    from core.llm import get_client
+    _c = get_client()
 
     class _W:
         def generate_content(self, contents):
@@ -206,9 +204,9 @@ def _process_pdf(path: Path, action: str, params: dict, speak=None) -> str:
         # If text is empty or missing local extractor, pass PDF bytes directly to Gemini 2.5 Flash multimodal
         if not text.strip():
             try:
-                from google import genai
                 from google.genai import types
-                c = genai.Client(api_key=_get_api_key())
+                from core.llm import get_client
+                c = get_client()
                 pdf_bytes = path.read_bytes()
                 part = types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf")
                 prompt_map = {
@@ -821,12 +819,64 @@ def _process_pptx(path: Path, action: str, params: dict, speak=None) -> str:
 
     return f"Unknown PPTX action: '{action}'. Try: summarize, extract_text, analyze"
 
+
+def _resolve_file_path(raw: str) -> Path:
+    if not raw or not raw.strip():
+        return Path("")
+
+    raw_clean = raw.strip().strip("'\"").replace("\\", "/")
+    lower = raw_clean.lower()
+
+    # 1. Direct path check
+    p = Path(raw_clean).expanduser()
+    if p.exists():
+        return p
+
+    # 2. Known folder prefixes: downloads/..., desktop/..., documents/..., etc.
+    shortcuts = {
+        "downloads": Path.home() / "Downloads",
+        "desktop":   Path.home() / "Desktop",
+        "documents": Path.home() / "Documents",
+        "pictures":  Path.home() / "Pictures",
+        "music":     Path.home() / "Music",
+        "videos":    Path.home() / "Videos",
+        "home":      Path.home(),
+    }
+
+    for key, path_obj in shortcuts.items():
+        if lower.startswith(key + "/"):
+            remainder = raw_clean[len(key) + 1:]
+            candidate = path_obj / remainder
+            if candidate.exists():
+                return candidate
+            return candidate
+
+    # 3. Drive aliases (e.g. "e:/...", "d:/...")
+    for d in "abcdefghijklmnopqrstuvwxyz":
+        if lower.startswith(f"{d}:"):
+            return Path(raw_clean)
+
+    # 4. If just a filename, search in Downloads, Desktop, Documents, and current working dir
+    for search_dir in (Path.home() / "Downloads", Path.home() / "Desktop", Path.home() / "Documents", Path.cwd()):
+        candidate = search_dir / Path(raw_clean).name
+        if candidate.exists():
+            return candidate
+
+    return p
+
+
 def file_processor(parameters: dict, player=None, speak=None) -> str:
-    file_path_str = parameters.get("file_path", "").strip()
+    file_path_str = (
+        parameters.get("file_path")
+        or parameters.get("filepath")
+        or parameters.get("path")
+        or parameters.get("target")
+        or ""
+    ).strip()
     if not file_path_str:
         return "No file path provided."
 
-    path = Path(file_path_str)
+    path = _resolve_file_path(file_path_str)
     if not path.exists():
         return f"File not found: {file_path_str}"
     if not path.is_file():

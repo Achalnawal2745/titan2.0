@@ -3,8 +3,14 @@ import sys
 import platform
 from pathlib import Path
 
+BASE_DIR = Path(__file__).resolve().parent
+
 print("Installing requirements...")
-subprocess.run([sys.executable, "-m", "pip", "install", "-r", "requirements.txt"], check=True)
+subprocess.run(
+    [sys.executable, "-m", "pip", "install", "-r", str(BASE_DIR / "requirements.txt")],
+    check=True,
+    cwd=BASE_DIR,
+)
 
 print("Installing Playwright browsers...")
 subprocess.run([sys.executable, "-m", "playwright", "install"], check=True)

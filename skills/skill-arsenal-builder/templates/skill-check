@@ -1,0 +1,68 @@
+#!/bin/bash
+#
+# skill-check - Check for skill updates without downloading
+#
+# Compares local version with GitHub to see if updates are available.
+# Does not download anything - use skill-sync to actually update.
+#
+
+set -e
+
+SKILLS_DIR="/home/ubuntu/skills"
+
+echo "🔍 Checking for Skill Arsenal updates..."
+echo
+
+# Check if installed
+if [ ! -d "$SKILLS_DIR/.git" ]; then
+    echo "❌ Skills not installed"
+    echo "   Run 'skill-install' first"
+    exit 1
+fi
+
+cd "$SKILLS_DIR" || exit 1
+
+# Get current version
+LOCAL_COMMIT=$(git rev-parse HEAD)
+LOCAL_COMMIT_SHORT="${LOCAL_COMMIT:0:12}"
+LOCAL_DATE=$(git log -1 --format=%cd --date=short)
+
+# Fetch latest (quietly)
+git fetch origin main --quiet 2>/dev/null || {
+    echo "⚠️  Could not check for updates (network issue?)"
+    exit 1
+}
+
+# Get remote version
+REMOTE_COMMIT=$(git rev-parse origin/main)
+REMOTE_COMMIT_SHORT="${REMOTE_COMMIT:0:12}"
+REMOTE_DATE=$(git log origin/main -1 --format=%cd --date=short)
+
+echo "Current version: $LOCAL_COMMIT_SHORT ($LOCAL_DATE)"
+echo "Latest version:  $REMOTE_COMMIT_SHORT ($REMOTE_DATE)"
+echo
+
+if [ "$LOCAL_COMMIT" = "$REMOTE_COMMIT" ]; then
+    echo "✅ You have the latest version"
+    echo
+    exit 0
+fi
+
+# Count commits behind
+COMMITS_BEHIND=$(git rev-list --count HEAD..origin/main)
+
+echo "📦 Updates available ($COMMITS_BEHIND commits):"
+echo
+git log --oneline --decorate --color=always "$LOCAL_COMMIT..origin/main" | head -10
+echo
+
+# Count new skills
+NEW_SKILLS=$(git diff --name-only "$LOCAL_COMMIT..origin/main" | grep -c "skills/.*/SKILL.md" || true)
+
+if [ "$NEW_SKILLS" -gt 0 ]; then
+    echo "✨ $NEW_SKILLS new or updated skills"
+    echo
+fi
+
+echo "Run 'skill-sync' to update"
+echo

@@ -553,7 +553,22 @@ def shutdown_computer():
     else:
         subprocess.run(["systemctl", "poweroff"], capture_output=True)
 
+def empty_recycle_bin():
+    if _OS == "Windows":
+        try:
+            import ctypes
+            ctypes.windll.shell32.SHEmptyRecycleBinW(None, None, 7)
+        except Exception:
+            subprocess.run(["powershell", "-Command", "Clear-RecycleBin -Force -ErrorAction SilentlyContinue"], capture_output=True, timeout=5, **_WIN_HIDE)
+    elif _OS == "Darwin":
+        subprocess.run(["osascript", "-e", 'tell application "Finder" to empty trash'], capture_output=True)
+    else:
+        subprocess.run(["rm", "-rf", os.path.expanduser("~/.local/share/Trash/*")], capture_output=True)
+
 ACTION_MAP: dict[str, callable] = {
+    "empty_recycle_bin":   empty_recycle_bin,
+    "clear_recycle_bin":   empty_recycle_bin,
+    "empty_trash":         empty_recycle_bin,
     "volume_up":           volume_up,
     "volume_down":         volume_down,
     "mute":                volume_mute,

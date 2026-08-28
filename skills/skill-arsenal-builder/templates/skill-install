@@ -1,0 +1,82 @@
+#!/bin/bash
+#
+# skill-install - First-time setup for Manus Skill Arsenal
+#
+# This script clones the unified skill arsenal from GitHub and sets up
+# the local environment for skill syncing across Manus terminals.
+#
+
+set -e
+
+SKILLS_DIR="/home/ubuntu/skills"
+REPO_URL="https://github.com/abcnuts/manus-skills"
+SYNC_SCRIPTS_DIR="/home/ubuntu/skill-sync-system"
+
+echo "🚀 Installing Manus Skill Arsenal..."
+echo
+
+# Check if already installed
+if [ -d "$SKILLS_DIR/.git" ]; then
+    echo "⚠️  Skills already installed at $SKILLS_DIR"
+    echo "   Run 'skill-sync' to update instead"
+    exit 1
+fi
+
+# Clone repository
+echo "📥 Cloning repository from GitHub..."
+if gh repo clone abcnuts/manus-skills "$SKILLS_DIR"; then
+    echo "✅ Cloned manus-skills repository"
+else
+    echo "❌ Failed to clone repository"
+    echo "   Make sure GitHub CLI is authenticated: gh auth login"
+    exit 1
+fi
+
+cd "$SKILLS_DIR" || exit 1
+
+# Count skills
+SKILL_COUNT=$(find skills/ -mindepth 2 -maxdepth 2 -type d 2>/dev/null | wc -l)
+CATEGORY_COUNT=$(find skills/ -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)
+
+# Get current version
+COMMIT_HASH=$(git rev-parse HEAD)
+COMMIT_DATE=$(git log -1 --format=%cd --date=short)
+
+# Create version file
+cat > .skill-sync-version << EOF
+{
+  "version": "${COMMIT_HASH:0:12}",
+  "commit_hash": "$COMMIT_HASH",
+  "last_sync": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "skills_count": $SKILL_COUNT,
+  "categories_count": $CATEGORY_COUNT,
+  "remote_url": "$REPO_URL"
+}
+EOF
+
+echo "✅ Installed $SKILL_COUNT skills across $CATEGORY_COUNT categories"
+echo
+
+# Verify installation
+echo "🔍 Verifying installation..."
+if python3 -c "import sys; sys.path.insert(0, '$SKILLS_DIR'); from lib.skill_registry import SkillRegistry; r = SkillRegistry('$SKILLS_DIR/skills.json'); print(f'✅ Registry loaded: {r.get_stats()[\"total_skills\"]} skills')" 2>/dev/null; then
+    echo "✅ Skill registry working"
+else
+    echo "⚠️  Registry verification failed (non-critical)"
+fi
+
+echo
+echo "📊 Installation Summary:"
+echo "   Repository: $REPO_URL"
+echo "   Local Path: $SKILLS_DIR"
+echo "   Version: ${COMMIT_HASH:0:12} ($COMMIT_DATE)"
+echo "   Skills: $SKILL_COUNT"
+echo "   Categories: $CATEGORY_COUNT"
+echo
+echo "🎯 Skills ready to use!"
+echo
+echo "Next steps:"
+echo "  - Run 'skill-status' to see current status"
+echo "  - Run 'skill-sync' to check for updates"
+echo "  - Read skills at: $SKILLS_DIR/skills/"
+echo

@@ -12,6 +12,7 @@ to buttons, often without bringing the window to the front.
 import pyautogui
 import pyperclip
 import time
+import re
 from colorama import Fore, Style, init
 
 init(autoreset=True)
@@ -34,7 +35,7 @@ def _get_app(app_name: str):
         from pywinauto import Desktop
         try:
             name_lower = app_name.lower()
-            search_title = f"(?i).*{app_name}.*"
+            search_title = f"(?i).*{re.escape(app_name)}.*"
             if "chrome" in name_lower: 
                 search_title = "(?i).*(Google Chrome|Chrome|Profile).*" 
             
@@ -174,7 +175,7 @@ def ui_get_text(app_name: str, element_name: str) -> str:
         app = _get_app(app_name)
         dlg = app.top_window()
         
-        element = dlg.child_window(title_re=f".*{element_name}.*", found_index=0)
+        element = dlg.child_window(title_re=f".*{re.escape(element_name)}.*", found_index=0)
         text = element.window_text()
         
         if not text:

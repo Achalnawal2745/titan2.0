@@ -62,6 +62,33 @@ function connectToShadowPC() {
                         break;
                     }
                     case 'get_state': {
+                      // Chrome's built-in PDF viewer is an extension page, not
+                      // an ordinary DOM page. DOM injection there returns an
+                      // empty state, so report the real tab and a useful reason.
+                      const [activeTab] = await chrome.tabs.query({
+                        active: true,
+                        lastFocusedWindow: true,
+                      });
+                      const activeUrl = activeTab?.url || '';
+                      const isPdfViewer =
+                        activeUrl.toLowerCase().includes('.pdf') ||
+                        activeUrl.startsWith('chrome-extension://') &&
+                        (activeTab?.title || '').toLowerCase().includes('.pdf');
+                      if (isPdfViewer) {
+                        ws.send(JSON.stringify({
+                          id: message.id,
+                          state: 'COMPLETE',
+                          result: {
+                            url: activeUrl,
+                            title: activeTab?.title || '',
+                            interactive_elements: '',
+                            tabs: [],
+                            unsupported: 'Chrome PDF viewer has no injectable page DOM. Use the local document/PDF reader for this file.',
+                            content_type: 'application/pdf',
+                          },
+                        }));
+                        return;
+                      }
                         const browserState = await browserContext.getState(true);
                         const elementsText = browserState.elementTree.clickableElementsToString(
                             DEFAULT_AGENT_OPTIONS.includeAttributes

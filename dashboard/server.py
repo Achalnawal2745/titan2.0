@@ -16,7 +16,6 @@ import secrets
 import socket
 import string
 import time
-import uuid
 from pathlib import Path
 
 _DEPS_OK = False
@@ -382,8 +381,6 @@ class DashboardServer:
         self._pending_keys: dict[str, float] = {}
         self._device_sessions: dict[str, dict] = {}  # device_token → {session_key}
         self._phone_audio_queue: asyncio.Queue    = asyncio.Queue(maxsize=200)
-        self._chrome_extension_ws: WebSocket | None = None
-        self._pending_extension_cmds: dict[str, asyncio.Future] = {}
         self._uploads_dir                 = UPLOADS_DIR
         self._login_html                  = _read("login.html")
         self._app_html                    = _read("app.html")
@@ -750,49 +747,6 @@ class DashboardServer:
                 pass
             finally:
                 self._clients.discard(websocket)
-
-        @app.websocket("/")
-        async def shadow_link_ext_ws(websocket: WebSocket):
-            await websocket.accept()
-            self._chrome_extension_ws = websocket
-            print("[Shadow-Link] ✅ Chrome Extension connected on ws://127.0.0.1:8000/")
-            try:
-                while True:
-                    data = await websocket.receive_json()
-                    msg_id = data.get("id")
-                    if msg_id and msg_id in self._pending_extension_cmds:
-                        fut = self._pending_extension_cmds[msg_id]
-                        if not fut.done():
-                            fut.set_result(data)
-            except Exception:
-                print("[Shadow-Link] ❌ Chrome Extension disconnected")
-            finally:
-                self._chrome_extension_ws = None
-
-        @app.websocket("/client")
-        async def shadow_link_client_ws(websocket: WebSocket):
-            await websocket.accept()
-            try:
-                while True:
-                    cmd = await websocket.receive_json()
-                    msg_id = cmd.get("id") or str(uuid.uuid4())
-                    cmd["id"] = msg_id
-                    if self._chrome_extension_ws:
-                        loop = asyncio.get_running_loop()
-                        fut = loop.create_future()
-                        self._pending_extension_cmds[msg_id] = fut
-                        await self._chrome_extension_ws.send_json(cmd)
-                        try:
-                            res = await asyncio.wait_for(fut, timeout=15.0)
-                            await websocket.send_json(res)
-                        except asyncio.TimeoutError:
-                            await websocket.send_json({"id": msg_id, "state": "ERROR", "msg": "Timeout waiting for Chrome extension"})
-                        finally:
-                            self._pending_extension_cmds.pop(msg_id, None)
-                    else:
-                        await websocket.send_json({"id": msg_id, "state": "ERROR", "msg": "No Chrome extension connected on ws://127.0.0.1:8000/"})
-            except Exception:
-                pass
 
         return app
 

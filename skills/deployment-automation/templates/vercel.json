@@ -1,0 +1,18 @@
+{
+  "version": 2,
+  "name": "{{PROJECT_NAME}}",
+  "builds": [
+    {
+      "src": "package.json",
+      "use": "@vercel/next"
+    }
+  ],
+  "env": {
+    "DATABASE_URL": "@database_url",
+    "API_KEY": "@api_key"
+  },
+  "regions": ["iad1"],
+  "github": {
+    "silent": true
+  }
+}

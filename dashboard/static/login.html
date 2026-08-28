@@ -118,14 +118,23 @@
       text-align: left;
     }
     .voice-note code {
-      background: rgba(255,255,255,0.06); padding: 1px 5px; border-radius: 4px;
-      color: var(--text); font-family: monospace; font-size: 10px;
+      background: rgba(255,255,255,0.07);
+      padding: 1px 4px;
+      border-radius: 3px;
+      font-family: 'Courier New', monospace;
+      font-size: 9px;
+    }
+    #reconnecting {
+      display: none;
+      color: var(--muted);
+      font-size: 12px;
+      margin-bottom: 16px;
     }
   </style>
 </head>
 <body>
   <div class="card" id="card">
-    <div class="logo"><em>T</em>ITAN</div>
+    <div class="logo"><em>J</em>ARVIS</div>
     <div class="sub">Remote Access</div>
     <p id="reconnecting">Reconnecting…</p>
     <p class="hint">Press <strong style="color:var(--text)">Remote Control</strong> in the TITAN desktop app to get a QR code or session key.</p>

@@ -1,0 +1,88 @@
+name: Deploy to TestFlight (Expo)
+
+on:
+  # Manual trigger - recommended for initial setup
+  workflow_dispatch:
+  
+  # Uncomment to trigger on tags (e.g., v1.0.0)
+  # push:
+  #   tags:
+  #     - 'v*'
+  
+  # Uncomment to trigger on push to main branch
+  # push:
+  #   branches:
+  #     - main
+
+jobs:
+  deploy-ios:
+    name: Build and Deploy iOS to TestFlight
+    runs-on: macos-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+      
+      - name: Install dependencies
+        run: npm ci
+      
+      - name: Setup Expo
+        uses: expo/expo-github-action@v8
+        with:
+          expo-version: latest
+          eas-version: latest
+          token: ${{ secrets.EXPO_TOKEN }}
+      
+      - name: Build iOS app with EAS
+        run: |
+          eas build --platform ios --profile production --non-interactive --no-wait
+          echo "Build started. Waiting for completion..."
+          eas build:list --platform ios --limit 1 --json > build-info.json
+          BUILD_ID=$(cat build-info.json | jq -r '.[0].id')
+          echo "BUILD_ID=$BUILD_ID" >> $GITHUB_ENV
+      
+      - name: Wait for build completion
+        run: |
+          echo "Waiting for build $BUILD_ID to complete..."
+          while true; do
+            STATUS=$(eas build:view $BUILD_ID --json | jq -r '.status')
+            echo "Build status: $STATUS"
+            if [ "$STATUS" = "FINISHED" ]; then
+              echo "Build completed successfully!"
+              break
+            elif [ "$STATUS" = "ERRORED" ] || [ "$STATUS" = "CANCELED" ]; then
+              echo "Build failed with status: $STATUS"
+              exit 1
+            fi
+            sleep 30
+          done
+      
+      - name: Download .ipa file
+        run: |
+          eas build:download --platform ios --latest --output app.ipa
+          ls -lh app.ipa
+      
+      - name: Upload to TestFlight
+        uses: apple-actions/upload-testflight-build@v3
+        with:
+          app-path: app.ipa
+          issuer-id: ${{ secrets.APPSTORE_ISSUER_ID }}
+          api-key-id: ${{ secrets.APPSTORE_API_KEY_ID }}
+          api-private-key: ${{ secrets.APPSTORE_API_PRIVATE_KEY }}
+      
+      - name: Notify success
+        if: success()
+        run: |
+          echo "✅ Build successfully uploaded to TestFlight!"
+          echo "Check App Store Connect for processing status."
+      
+      - name: Notify failure
+        if: failure()
+        run: |
+          echo "❌ Deployment failed. Check the logs above for details."

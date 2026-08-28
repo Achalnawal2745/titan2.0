@@ -168,12 +168,18 @@ python main.py
 *or simply double-click **`TITAN AI Assistant.lnk`** on your Desktop.*
 
 ### 3. API Configuration
-Add your Gemini API key in `config/api_keys.json`:
+Copy the template configuration file:
+```bash
+cp config/api_keys.example.json config/api_keys.json
+```
+And add your API keys in `config/api_keys.json`:
 ```json
 {
   "gemini_api_key": "YOUR_GEMINI_API_KEY",
+  "nvidia_api_key": "YOUR_NVIDIA_API_KEY",
   "assistant_name": "TITAN",
-  "user_name": "Achal"
+  "user_name": "Sir",
+  "full_brain_mode": false
 }
 ```
 

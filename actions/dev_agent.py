@@ -19,14 +19,16 @@ MAX_FIX_ATTEMPTS = 5
 MODEL_PLANNER    = "gemini-2.5-flash"
 MODEL_WRITER     = "gemini-2.5-flash"
 
-def _get_api_key() -> str:
-    with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)["gemini_api_key"]
-
-
 def _get_model(model_name: str):
-    from google import genai
-    _c = genai.Client(api_key=_get_api_key())
+    """Thin wrapper kept for the many `model.generate_content(prompt)` call
+    sites below, but the client itself now comes from core.llm.get_client()
+    instead of building its own — dev_agent no longer has its own copy of
+    key-loading/client-construction logic. Rate-limit classification and the
+    fix-retry loop stay here since _build_project's retry strategy (whole
+    project re-plan on RateLimitError) is different from core.llm.generate's
+    per-call backoff."""
+    from core.llm import get_client
+    _c = get_client()
 
     class _W:
         def generate_content(self, contents):

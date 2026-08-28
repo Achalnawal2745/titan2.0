@@ -29,7 +29,8 @@ except ImportError:
     Style = _S()
 
 # Configuration
-VAULT_DIR = "shadow_vault"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+VAULT_DIR = os.path.join(BASE_DIR, "shadow_vault")
 BRIDGE_PORT = 8002
 
 class ShadowBridge:
@@ -149,7 +150,8 @@ class ShadowBridge:
             self.log("SUCCESS", f"Task Finalized: {msg}", Fore.GREEN)
             result_path = self.save_finding(payload.get("result", {}), "task_result")
             self.log("VAULT", f"Stored result at {result_path}", Fore.BLUE)
-            os.startfile(os.path.abspath(VAULT_DIR))
+            if hasattr(os, "startfile"):
+                os.startfile(os.path.abspath(VAULT_DIR))
             
         elif state == "EXTRACT":
             self.log("DATA", "Extracted information received", Fore.YELLOW)

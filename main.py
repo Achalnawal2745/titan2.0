@@ -1,17 +1,54 @@
 import os
-import warnings
-os.environ["PYTHONWARNINGS"] = "ignore"
-warnings.simplefilter("ignore", DeprecationWarning)
-warnings.filterwarnings("ignore", category=DeprecationWarning)
-warnings.filterwarnings("ignore", module="sounddevice")
-warnings.filterwarnings("ignore", message=".*Setting the shape on a NumPy array.*")
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["NUMEXPR_NUM_THREADS"] = "1"
 os.environ["OMP_NUM_THREADS"] = "1"
 import platform as _platform
 import subprocess as _subprocess
+import warnings
 os.environ["QT_LOGGING_RULES"] = "*.debug=false;qt.qpa.*=false;qt.text.*=false;qt.qpa.window=false"
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+
+try:
+    import colorama
+    colorama.just_fix_windows_console()
+except Exception:
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        hStdOut = kernel32.GetStdHandle(-11)
+        mode = ctypes.c_ulong()
+        kernel32.GetConsoleMode(hStdOut, ctypes.byref(mode))
+        kernel32.SetConsoleMode(hStdOut, mode.value | 0x0004)
+    except Exception:
+        pass
+
+# ── Nuclear: force CREATE_NO_WINDOW on EVERY subprocess call on Windows ───────
+# This patches Popen itself, so no per-file flag is needed anywhere.
+if _platform.system() == "Windows":
+    _OrigPopen = _subprocess.Popen
+
+    class _Popen(_OrigPopen):
+        def __init__(self, args, **kw):
+            kw["creationflags"] = kw.get("creationflags", 0) | _subprocess.CREATE_NO_WINDOW
+            kw.pop("startupinfo", None)   # drop any stale/shared STARTUPINFO
+            super().__init__(args, **kw)
+
+    _subprocess.Popen = _Popen
+# ─────────────────────────────────────────────────────────────────────────────
+
+import asyncio
+import re
+import os
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
+os.environ["OMP_NUM_THREADS"] = "1"
+import platform as _platform
+import subprocess as _subprocess
+import warnings
+os.environ["QT_LOGGING_RULES"] = "*.debug=false;qt.qpa.*=false;qt.text.*=false;qt.qpa.window=false"
+warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 try:
     import colorama
@@ -44,6 +81,7 @@ if _platform.system() == "Windows":
 import asyncio
 import re
 import threading
+import queue
 import time
 import json
 import sys
@@ -80,7 +118,7 @@ from actions.computer_control  import computer_control
 from actions.game_updater      import game_updater
 from actions.shadow_link       import shadow_link_control
 from actions.system_monitor    import SystemMonitor, get_system_status
-from actions.skill_engine      import skill_engine
+
 from actions.proactive         import ProactiveEngine
 from actions.background_monitor import (
     add_monitor, remove_monitor, list_monitors, check_all as monitor_check_all,
@@ -91,7 +129,41 @@ from actions.voice_face_id import (
 )
 from actions.web_search        import _news as _fetch_news_sync
 from memory.config_manager     import get_brief_enabled
-from memory.work_pad           import run_work_pad, format_for_prompt as format_pad_for_prompt
+from memory.work_pad           import (
+    run_work_pad,
+    format_for_prompt as format_pad_for_prompt,
+    track_long_task,
+    absorb_work_output,
+    load_pad,
+    _next_step,
+)
+from task_control import set_ui_hooks
+from core.plugin_loader import discover_plugins
+from core.skill_registry import discover_skills
+from core.exec import run_command, RUN_COMMAND_DECLARATION
+from core.agent_loop import main_agent_loop
+from core.session_log import session_logger
+from core.todo_engine import todo_engine, TODO_WRITE_DECLARATION, TODO_READ_DECLARATION
+from core.goal_manager import goal_manager, GOAL_TOOLS_DECLARATIONS
+from core.scheduler import scheduler, SCHEDULE_DECLARATION
+from core.interaction import interaction_engine, ASK_USER_DECLARATION
+from core.plan_mode import plan_mode, PLAN_MODE_DECLARATIONS
+from core.workflow_engine import workflow_engine, WORKFLOW_DECLARATION
+from core.jobs import job_registry, JOB_TOOLS_DECLARATIONS
+from core.subagent_engine import subagent_engine, SUBAGENT_TOOLS_DECLARATIONS
+from core.fs_tools import (
+    read_file, write_file, str_replace_editor, grep_search, glob_search,
+    FS_TOOLS_DECLARATIONS,
+)
+from core.code_runner import run_python_code, PYTHON_EVAL_DECLARATION
+from core.web_tools import web_fetch, WEB_FETCH_DECLARATION
+from core.nvidia_brain import run_brain_turn
+
+
+def _finalize(raw):
+    if raw is None:
+        return "⚠️ No result came back from the tool."
+    return str(raw).strip() or "Done."
 
 
 def get_base_dir():
@@ -103,6 +175,37 @@ def get_base_dir():
 BASE_DIR        = get_base_dir()
 API_CONFIG_PATH = BASE_DIR / "config" / "api_keys.json"
 PROMPT_PATH     = BASE_DIR / "core" / "prompt.txt"
+
+# ── Full-Brain mode ─────────────────────────────────────────────────────
+# When True: Gemini Live gets NO tools and NO planning system prompt — it's
+# reduced to STT-in/TTS-out. Every user utterance is instead routed to
+# core/nvidia_brain.run_brain_turn(), which calls NVIDIA NIM to plan and
+# execute tool calls. Gemini only speaks the final text NVIDIA hands back.
+# Flip to False (or set "full_brain_mode": false in config/api_keys.json)
+# to go back to Gemini deciding + calling tools itself, same as before.
+def _full_brain_enabled() -> bool:
+    try:
+        cfg = json.loads(API_CONFIG_PATH.read_text(encoding="utf-8"))
+        return bool(cfg.get("full_brain_mode", False))
+    except Exception:
+        return False
+
+
+_SILENT_RELAY_PROMPT = (
+    "You are a text-to-speech relay, not an assistant. You have NO tools "
+    "and must never claim to have done anything.\n"
+    "Rules:\n"
+    "1. You will receive messages starting with '[SPEAK_NOW]' — when you "
+    "get one, speak that exact text aloud, in your own natural voice/pacing, "
+    "without adding new facts, opinions, or offers.\n"
+    "2. If you receive audio/speech from the user directly (not a "
+    "[SPEAK_NOW] message), do NOT answer it yourself and do NOT guess an "
+    "answer. Just stay silent / say a brief neutral filler like 'mm' at "
+    "most — a separate planning system is handling the real answer and "
+    "will send it to you shortly as [SPEAK_NOW].\n"
+    "3. Never invent information. Never call a function. Never say a task "
+    "is done unless it appeared inside a [SPEAK_NOW] message."
+)
 LIVE_MODELS = [
     "models/gemini-2.5-flash-native-audio-preview-12-2025",
     "models/gemini-3.1-flash-live-preview",
@@ -110,9 +213,11 @@ LIVE_MODELS = [
 ]
 _live_model_idx = 0
 
+
 def _get_live_model() -> str:
     global _live_model_idx
     return LIVE_MODELS[_live_model_idx % len(LIVE_MODELS)]
+
 
 def _rotate_live_model() -> str:
     global _live_model_idx
@@ -120,6 +225,7 @@ def _rotate_live_model() -> str:
     m = LIVE_MODELS[_live_model_idx % len(LIVE_MODELS)]
     print(f"[TITAN] 🔄 Switching to model: {m}")
     return m
+
 
 CHANNELS            = 1
 SEND_SAMPLE_RATE    = 16000
@@ -131,17 +237,26 @@ _DEBUG_AUDIO = False          # was True — per-chunk prints stall the event lo
 _dbg_chunk_count = 0
 
 # Local VAD — stream speech only, then tell Gemini "user stopped"
-# Real speech in your logs is RMS 800–1900. 420 was picking up echo → fake turns.
-_VAD_START_RMS      = 580.0
-_VAD_HOLD_RMS       = 320.0
-_VAD_PREROLL        = 6       # ~192 ms before speech start
-_VAD_END_SILENCE    = 18      # ~576 ms quiet → end of turn
-_VAD_MIN_SPEECH     = 10      # need ~320 ms of real speech before we may end
+# Real speech in your logs is RMS 800–1900. Titan speaker leak is 3000+.
+# 18-chunk (~0.6s) end-silence was cutting you mid-sentence → "say that again".
+_VAD_START_RMS      = 640.0
+_VAD_HOLD_RMS       = 360.0
+_VAD_PREROLL        = 8       # ~256 ms before speech start
+_VAD_END_SILENCE    = 42      # ~1.34 s quiet → end of turn
+_VAD_MIN_SPEECH     = 14      # need ~450 ms of real speech before we may end
 _SEND_QUEUE_MAX     = 16
-_ECHO_TAIL_S        = 0.85    # swallow speaker tail (was 0.25 — too short)
-_VAD_SUPPRESS_S     = 0.90    # after ESC / interrupt, ignore mic this long
-_END_DEBOUNCE_S     = 1.10    # don't send audio_stream_end twice in a row
+_ECHO_TAIL_S        = 1.25    # swallow speaker tail after Titan stops
+_VAD_SUPPRESS_S     = 1.40    # after ESC / interrupt, ignore mic this long
+_END_DEBOUNCE_S     = 1.40    # don't send audio_stream_end twice in a row
 _AUDIO_MIME         = "audio/pcm;rate=16000"
+# Talk-while-working: higher than keyboard/fan, lower than a real sentence.
+_VAD_BUSY_START_RMS = 880.0
+_VAD_BUSY_HOLD_RMS  = 420.0
+_VAD_BUSY_MIN_SPEECH = 16     # ~0.5 s so a click does not cancel the job
+_WORK_TOOLS = {
+    "file_controller", "run_command", "load_skill", "code_helper",
+    "file_processor", "work_pad", "dev_agent", "web_search",
+}
 
 def _dbg(tag: str, msg: str):
     if _DEBUG_AUDIO:
@@ -179,40 +294,17 @@ def _load_system_prompt() -> str:
             "Be concise, direct, and always use the provided tools to complete tasks. "
             "Never simulate or guess results — always call the appropriate tool."
         )
-    
     try:
-        from actions.skill_engine import skill_engine
-        detailed = []
-        try:
-            detailed = skill_engine.list_skills_detailed()
-        except Exception:
-            detailed = [{"name": n} for n in skill_engine.list_skills()]
-        if detailed:
-            prompt_text += f"\n\nCURRENT ACTIVE CUSTOM SKILLS: {detailed}\n"
-            prompt_text += (
-                "PROACTIVE SKILL RULE: When the user asks for any task matching an active skill, "
-                "call skill_engine action='execute_skill' IMMEDIATELY. "
-                "Never ask 'should I use my skill' — just run it.\n"
-            )
+        from actions.file_controller import _windows_shell_folder
+        desk_p = _windows_shell_folder("Desktop") or (Path.home() / "Desktop")
+        down_p = _windows_shell_folder("Downloads") or (Path.home() / "Downloads")
+        docs_p = _windows_shell_folder("Documents") or (Path.home() / "Documents")
         prompt_text += (
-            "\n\nSKILL-MAKING RULES (you CAN invent new abilities):\n"
-            "If no built-in tool can do the job (gold price, cricket score, PDF invoice parse, "
-            "unit convert, custom calculator, etc.) you MUST create a skill instead of saying you cannot.\n"
-            "Workflow:\n"
-            "1) Tell the user in ONE short sentence that you are writing a skill.\n"
-            "2) skill_engine action='create_skill' with COMPLETE python:\n"
-            "   REQUIREMENTS = [\"requests\"]   # pip names, or [] if stdlib only\n"
-            "   def do_the_thing(...): ...\n"
-            "   def test():\n"
-            "       r = do_the_thing()\n"
-            "       assert r is not None\n"
-            "       return True\n"
-            "3) If the result is SAVED_BUT_TESTS_FAILED: read the traceback, fix the code, "
-            "call action='edit_skill' with the FULL new file. Repeat until success=True.\n"
-            "4) Then action='execute_skill' with function_name + kwargs and speak the result.\n"
-            "Never pip-install into the user's main Python — the engine uses its own sandbox venv.\n"
-            "Use action='run_command' only for sandbox pip/python/pytest (e.g. 'pip list', 'python -c \"import pandas; print(pandas.__version__)\"').\n"
-            "Use action='test_skill' to re-run tests without rewriting.\n"
+            f"\n\nUSER DIRECTORIES (ALWAYS use these exact paths when saving or finding files):\n"
+            f"- Desktop: {str(desk_p).replace(chr(92), '/')}\n"
+            f"- Downloads: {str(down_p).replace(chr(92), '/')}\n"
+            f"- Documents: {str(docs_p).replace(chr(92), '/')}\n"
+            f"Never invent paths like 'E:/auto/shadowos/Desktop' — the real Desktop is at {str(desk_p).replace(chr(92), '/')}.\n"
         )
     except Exception:
         pass
@@ -223,6 +315,20 @@ def _load_system_prompt() -> str:
             prompt_text += "\n\n" + pad_txt
     except Exception:
         pass
+
+    try:
+        job_txt = format_job_for_prompt()
+        if job_txt:
+            prompt_text += "\n\n" + job_txt
+    except Exception:
+        pass
+
+    prompt_text += (
+        "\n\nTASK CHECKLIST PROTOCOL: Use `todo_write` as your dynamic checklist to plan and track multi-step tasks. "
+        "When starting a complex task (documents, presentations, multi-step code), call `todo_write` (action='set_plan', title='...', steps=['step 1', 'step 2', ...]) "
+        "to break down what needs to be done. As you finish each step, call `todo_write` (action='update_step', step_id=N, status='completed') "
+        "so the live checklist on the Workpad is always updated for sir.\n"
+    )
 
     prompt_text += (
         "\n\nCLOCK RULE: The date/time printed at session start goes STALE. "
@@ -239,9 +345,58 @@ def _load_system_prompt() -> str:
         "naturally in your own voice — don't read it robotically."
     )
 
+    prompt_text += (
+        "\n\nMID-TASK TALK: If sir talks while a tool is running, the job STOPS and does not save. "
+        "You will then hear what he said. Follow THAT. "
+        "stop / wait / don't touch → do not call the same tool again. "
+        "A specific change ('don't touch the cover', 'change the title') → only that change. "
+        "Do not restart the old job unless he says continue.\n"
+        "DOC QUALITY: Professional/academic reports = Times New Roman 12pt 1.5 ON THE TEMPLATE "
+        "(via the docx skill). NEVER a generic navy/Segoe AI report. After write, verify formatting and fonts.\n"
+        "STEP-BY-STEP WORKFLOW:\n"
+        "For any complex, creative, or multi-step request (documents, presentations, analysis, coding):\n"
+        "1. First Plan on Workpad: Call `todo_write` (action='set_plan', title='...', steps=[...]) to break down the task.\n"
+        "2. Execute Step-by-Step: Systematically execute each step using your real tools (load_skill, run_command, file_controller).\n"
+        "3. Mark Progress: Update step statuses via `todo_write` (action='update_step', step_id=N, status='completed').\n"
+        "4. Verify & Deliver: Confirm that the output is ready before reporting to sir.\n"
+    )
+
+    prompt_text += (
+        "\n\nCOMPLETION HONESTY — THIS IS A HARD RULE, NOT A STYLE PREFERENCE:\n"
+        "Never say a file/task is done, saved, updated, ready, improved, or 'तैयार है' / 'बना दिया है' "
+        "unless a tool call (run_command, file_controller, etc.) actually ran and SUCCEEDED in "
+        "*this same turn or the immediately preceding one*. Saying it's done without that is a lie to sir, "
+        "not politeness — never do it, even if he sounds impatient or angry.\n"
+        "If work is not actually finished yet: say plainly that you are calling the tool now, then CALL IT — "
+        "in the same turn. Do not respond with only reassurance ('थोड़ा समय लगेगा', 'प्रक्रिया चल रही है', "
+        "'कर रहा हूँ') with no tool call behind it. A turn with no tool call and no new information is a "
+        "wasted turn sir can hear — if you are not ready to speak the real answer, you are ready to call a tool.\n"
+        "If sir asks 'did you actually do something' / 'kuch kiya kya' / 'दिख नहीं रहा': answer honestly from "
+        "the ACTUAL last tool result, not from what you said earlier. If the last real attempt failed or you "
+        "never called the tool, say so directly ('माफ़ कीजिए sir, अभी तक नहीं बना — अभी बनाता हूँ') and then "
+        "immediately call the tool — don't apologize in words only and stall again.\n"
+        "Every one of your spoken turns about an in-progress file job must either (a) contain a tool call, or "
+        "(b) report the exit_code/result of a tool call that just ran. Never a bare reassurance sentence with "
+        "neither.\n"
+    )
+
     return prompt_text
 
 _CTRL_RE = re.compile(r"<ctrl\d+>", re.IGNORECASE)
+
+def _looks_tool_error(text: str) -> bool:
+    t = (text or "").strip()
+    if not t:
+        return False
+    head = t[:90].lower()
+    return (
+        t.startswith("❌")
+        or head.startswith("error")
+        or " failed" in head
+        or "traceback" in t.lower()
+        or "unexpected" in head
+        or "got an unexpected" in t.lower()
+    )
 
 def _clean_transcript(text: str) -> str:    
     text = _CTRL_RE.sub("", text)
@@ -267,28 +422,6 @@ TOOL_DECLARATIONS = [
                 "index": {"type": "INTEGER", "description": "Index if multiple elements match the same name (default 0)"}
             },
             "required": ["action", "app_name"]
-        }
-    },
-    {
-        "name": "smart_task",
-        "description": (
-            "Doc/presentation pipeline. Actions: generate_document (Word report), generate_presentation (PPTX deck), "
-            "generate_interactive_deck (HTML5 deck), fill_template (fill Word template), "
-            "answer_questions_in_doc, summarize_document, rewrite_document."
-        ),
-        "parameters": {
-            "type": "OBJECT",
-            "properties": {
-                "action": {"type": "STRING", "description": "generate_document | generate_presentation | generate_interactive_deck | fill_template | answer_questions_in_doc | summarize_document | rewrite_document"},
-                "topic": {"type": "STRING", "description": "Topic for document or presentation generation"},
-                "output_path": {"type": "STRING", "description": "Output file path (.docx, .pptx, or .html)"},
-                "source_path": {"type": "STRING", "description": "Input document or template path (.docx, .pdf, .txt)"},
-                "image_path": {"type": "STRING", "description": "Optional image on Desktop, Downloads, or disk to embed into Word doc or PPTX"},
-                "num_slides": {"type": "INTEGER", "description": "Number of slides for presentation (default 5)"},
-                "theme": {"type": "STRING", "description": "Visual theme: 'navy' | 'executive' | 'midnight' | 'crimson' | 'emerald'"},
-                "instruction": {"type": "STRING", "description": "Instruction for template fill, rewrite, or custom formatting"}
-            },
-            "required": ["action"]
         }
     },
     {
@@ -341,52 +474,7 @@ TOOL_DECLARATIONS = [
             "properties": {},
         }
     },
-    {
-        "name": "skill_engine",
-        "description": (
-            "Write, sandbox-test, and run NEW Python abilities at runtime. "
-            "Use this when no other tool can do the job. "
-            "create_skill writes the file, pip-installs REQUIREMENTS into an isolated venv "
-            "(never TITAN's own env), then runs test() inside that venv. "
-            "If tests fail, edit_skill with the FULL fixed file and try again. "
-            "Then execute_skill to actually run it. "
-            "Actions: create_skill | edit_skill | test_skill | execute_skill | "
-            "install_deps | run_command | get_code | skill_info | list_skills | delete_skill."
-        ),
-        "parameters": {
-            "type": "OBJECT",
-            "properties": {
-                "action": {
-                    "type": "STRING",
-                    "description": (
-                        "create_skill | edit_skill | test_skill | execute_skill | "
-                        "install_deps | run_command | get_code | skill_info | list_skills | delete_skill"
-                    )
-                },
-                "skill_name": {"type": "STRING", "description": "e.g. 'gold_price', 'invoice_parser'"},
-                "python_code": {
-                    "type": "STRING",
-                    "description": (
-                        "FULL skill file for create_skill/edit_skill. Must include "
-                        "REQUIREMENTS = [\"pip-name\", ...] (or []), at least one public function, "
-                        "and def test(): that asserts something real."
-                    )
-                },
-                "function_name": {"type": "STRING", "description": "Function to run for execute_skill"},
-                "kwargs": {"type": "OBJECT", "description": "Arguments for execute_skill"},
-                "packages": {
-                    "type": "ARRAY",
-                    "items": {"type": "STRING"},
-                    "description": "Pip packages for install_deps (installed only in the sandbox venv)"
-                },
-                "command": {
-                    "type": "STRING",
-                    "description": "Sandbox-only command for run_command: 'pip list', 'pip install x', 'python -c \"...\"', 'pytest'"
-                }
-            },
-            "required": ["action"]
-        }
-    },
+
     {
         "name": "get_clock",
         "description": (
@@ -396,38 +484,18 @@ TOOL_DECLARATIONS = [
         ),
         "parameters": {"type": "OBJECT", "properties": {}, "required": []}
     },
-    {
-        "name": "work_pad",
-        "description": (
-            "TITAN's working notebook. Several jobs at once, each with a checklist. "
-            "Use for any multi-step work (report, skill, files). "
-            "Actions: show | add_job | add_step | check | note | edit_job | "
-            "rewrite_steps | remove_step | remove_job | clear_done. "
-            "Silently update as you work. When the user asks what's left / what's done, call show."
-        ),
-        "parameters": {
-            "type": "OBJECT",
-            "properties": {
-                "action": {
-                    "type": "STRING",
-                    "description": (
-                        "show | add_job | add_step | check | note | edit_job | "
-                        "rewrite_steps | remove_step | remove_job | clear_done"
-                    )
-                },
-                "job": {"type": "STRING", "description": "Job id or title (e.g. 'capstone', 'gold_price')"},
-                "title": {"type": "STRING", "description": "Job title for add_job / edit_job"},
-                "goal": {"type": "STRING", "description": "One-line goal for add_job / edit_job"},
-                "text": {"type": "STRING", "description": "Step text, note text, or free text"},
-                "step": {"type": "STRING", "description": "Step number (1-based) or step text for check / remove_step"},
-                "state": {"type": "STRING", "description": "todo | doing | done | blocked  (for check)  OR active | paused | done (for edit_job)"},
-                "steps": {"type": "STRING", "description": "For add_job / rewrite_steps: 'step one | step two | step three'"},
-                "note": {"type": "STRING", "description": "Optional note on a step when checking it"},
-                "status": {"type": "STRING", "description": "active | paused | done for edit_job"},
-            },
-            "required": ["action"]
-        }
-    },
+    TODO_WRITE_DECLARATION,
+    TODO_READ_DECLARATION,
+    SCHEDULE_DECLARATION,
+    *GOAL_TOOLS_DECLARATIONS,
+    ASK_USER_DECLARATION,
+    *PLAN_MODE_DECLARATIONS,
+    WORKFLOW_DECLARATION,
+    *JOB_TOOLS_DECLARATIONS,
+    *SUBAGENT_TOOLS_DECLARATIONS,
+    *FS_TOOLS_DECLARATIONS,
+    PYTHON_EVAL_DECLARATION,
+    WEB_FETCH_DECLARATION,
     {
         "name": "weather_report",
         "description": "Gives the weather report to user",
@@ -866,6 +934,30 @@ TOOL_DECLARATIONS = [
         }
     },
     {
+        "name": "run_complex_task",
+        "description": (
+            "Hands a genuinely multi-step, multi-tool piece of WORK off to a slower but more careful "
+            "planning model (NVIDIA), which will call run_command/read_file/write_file/skills/etc itself, "
+            "check its own results, and retry on failure — then hand you back a finished result to speak. "
+            "Use for things like 'build me a PowerPoint on X', 'refactor this script and test it', "
+            "'research Y across a few sources and summarize', or any task where you'd otherwise need to "
+            "chain more than 2-3 tool calls yourself and verify output along the way. "
+            "Do NOT use this for a single tool call, a quick fact, small talk, or anything you can already "
+            "do directly in one or two steps — it's slower on purpose, so only reach for it when the task "
+            "actually has real multi-step complexity. Tell the user briefly you're working on it before calling this."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "task": {
+                    "type": "STRING",
+                    "description": "The complete task description with all context, constraints, and the exact deliverable expected — the planning model has no memory of this conversation beyond what you put here."
+                }
+            },
+            "required": ["task"]
+        }
+    },
+    {
         "name": "save_memory",
         "description": (
             "Save an important personal fact about the user to long-term memory. "
@@ -895,6 +987,7 @@ TOOL_DECLARATIONS = [
             "required": ["category", "key", "value"]
         }
     },
+    RUN_COMMAND_DECLARATION,
 ]
 
 # --- Plugin system ---
@@ -921,15 +1014,26 @@ class TitanLive:
         self.ui.on_text_command   = self._on_text_command
         self.ui.on_remote_clicked = self._make_remote_key
         self.ui.on_interrupt      = self.interrupt
+        try:
+            set_ui_hooks(
+                log=lambda m: self.ui.write_log(m if str(m).startswith("SYS:") else f"SYS: {m}"),
+                status=lambda title, body: self.ui.show_content(title, body),
+            )
+        except Exception:
+            pass
         self._turn_done_event: asyncio.Event | None = None
         self._dashboard     = None
         self._briefing_sent    = False          # morning briefing fires once per process
+        self._enhanced_live    = True           # affective dialog + proactive audio
         self._sys_monitor      = SystemMonitor()  # persistent cooldown state
         self._proactive        = ProactiveEngine()
         self._last_user_speech = time.monotonic()  # updated on every user utterance
         self._session_log: list[str] = []          # conversation turns for end-of-session summary
         self._tool_busy          = False
         self._tool_lock          = None          # asyncio.Lock, created in run()
+        self._busy_vad           = {"in_speech": False, "silence": 0, "voiced": 0}
+        self._midtask_pcm        = bytearray()
+        self._pending_midtask    = b""
         self._speak_ended_at     = 0.0
         self._vad_end_t          = 0.0           # for ⚡ first-audio timing
         self._first_audio_logged = False
@@ -937,6 +1041,40 @@ class TitanLive:
         self._drop_model_audio   = False         # ESC / interrupt: discard incoming audio
         self._vad_suppress_until = 0.0
         self._last_stream_end    = 0.0
+        self._speak_started_at   = 0.0           # when Titan started playing this utterance
+        self._action_ledger: list[dict] = []
+        self._full_brain          = True   # actual value set per-connect in _build_config()
+        self._nvidia_history: list[dict] = []   # OpenAI-format running history for full-brain mode
+        self._all_tool_declarations: list[dict] = []   # Gemini-format decls, reused for NVIDIA schema
+        self._brain_lock: asyncio.Lock | None = None   # serializes full-brain turns, created on the running loop
+        self._mute_brain_filler   = False   # True while suppressing playback of Gemini's own filler reply in full-brain mode
+        self._expect_brain_turn_complete = False   # True from the moment we inject [SPEAK_NOW] until its turn_complete arrives
+        try:
+            self.plugin_registry = discover_plugins(
+                BASE_DIR / "plugins",
+                core_tool_names={t["name"] for t in TOOL_DECLARATIONS},
+                logger=lambda m: self.ui.write_log(f"SYS: {m}"),
+            )
+        except Exception as e:
+            print(f"[Plugins] init error: {e}")
+            self.plugin_registry = None
+
+        try:
+            self.skill_registry = discover_skills(
+                [BASE_DIR / "skills"],
+                logger=lambda m: self.ui.write_log(f"SYS: {m}"),
+            )
+        except Exception as e:
+            print(f"[Skills] init error: {e}")
+            self.skill_registry = None
+
+    def _log_action(self, name: str, args: dict) -> None:
+        self._action_ledger.append({
+            "tool": name,
+            "args": {k: v for k, v in (args or {}).items() if k not in ("python_code", "code", "image_bytes")},
+            "time": datetime.now().strftime("%H:%M:%S"),
+        })
+        self._action_ledger[:] = self._action_ledger[-30:]
 
     def _make_remote_key(self):
         """Called from Qt main thread when user presses Remote Control."""
@@ -959,14 +1097,38 @@ class TitanLive:
             return
 
         if not self._loop or not self.session:
+            self.ui.write_log("SYS: Session connecting or not active yet.")
             return
-        asyncio.run_coroutine_threadsafe(
-            self.session.send_client_content(
-                turns={"parts": [{"text": text}]},
-                turn_complete=True
-            ),
-            self._loop
-        )
+
+        async def _send_text():
+            try:
+                # Reset interrupt and audio-drop flags so model response is accepted
+                self._interrupted = False
+                self._drop_model_audio = False
+                with self._speaking_lock:
+                    self._is_speaking = False
+                # Close any active mic stream turn so Gemini processes text immediately
+                self._qput_audio({"kind": "end"})
+                if self._turn_done_event:
+                    self._turn_done_event.clear()
+                self.ui.set_state("THINKING")
+                print(f"[TITAN] ⌨️ Text command sending: '{text}'")
+                try:
+                    await self.session.send_client_content(
+                        turns=[types.Content(parts=[types.Part.from_text(text=text)], role="user")],
+                        turn_complete=True,
+                    )
+                except Exception:
+                    await self.session.send_client_content(
+                        turns={"parts": [{"text": text}]},
+                        turn_complete=True,
+                    )
+                print(f"[TITAN] ⌨️ Text command sent successfully: '{text}'")
+            except Exception as e:
+                print(f"[TextCommand] Error sending text command: {e}")
+                self.ui.write_log(f"ERR: Text command error: {e}")
+
+        asyncio.run_coroutine_threadsafe(_send_text(), self._loop)
 
     def set_speaking(self, value: bool):
         with self._speaking_lock:
@@ -975,6 +1137,7 @@ class TitanLive:
         if value and not was:
             # Titan just started talking — drop leftover mic so it cannot
             # clog the websocket or barge-in on itself.
+            self._speak_started_at = time.monotonic()
             self._flush_out_queue()
             self.ui.set_state("SPEAKING")
         elif not value:
@@ -1019,6 +1182,45 @@ class TitanLive:
         except Exception:
             pass
 
+    def _flag_task_stop(self, reason: str = "") -> None:
+        """User talked (or ESC) while a tool is writing — do not save/overwrite."""
+        try:
+            from task_control import request_cancel
+            request_cancel(reason)
+        except Exception:
+            pass
+
+    def _reset_midtask(self) -> None:
+        self._busy_vad = {"in_speech": False, "silence": 0, "voiced": 0}
+        self._midtask_pcm = bytearray()
+
+    def _on_midtask_chunk(self, data: bytes, rms: float) -> None:
+        """Listen while a tool runs. Do NOT send to Gemini until the tool returns."""
+        st = self._busy_vad
+        if not st["in_speech"]:
+            if rms >= _VAD_BUSY_START_RMS:
+                st["in_speech"] = True
+                st["silence"] = 0
+                st["voiced"] = 1
+                self._midtask_pcm = bytearray(data)
+                self._flag_task_stop("mic")
+                print(f"[TITAN] 🛑 speech during task RMS={rms:.0f} — will not save if still writing")
+            return
+        self._midtask_pcm.extend(data)
+        if rms >= _VAD_BUSY_HOLD_RMS:
+            st["voiced"] = st.get("voiced", 0) + 1
+            st["silence"] = 0
+        else:
+            st["silence"] += 1
+            if st["silence"] >= _VAD_END_SILENCE and st.get("voiced", 0) >= _VAD_BUSY_MIN_SPEECH:
+                self._pending_midtask = bytes(self._midtask_pcm)
+                self._midtask_pcm = bytearray()
+                st.update({"in_speech": False, "silence": 0, "voiced": 0})
+                print(f"[TITAN] 🛑 captured {len(self._pending_midtask)} bytes during task")
+            elif st["silence"] >= _VAD_END_SILENCE:
+                self._midtask_pcm = bytearray()
+                st.update({"in_speech": False, "silence": 0, "voiced": 0})
+
     def interrupt(self, flush_mic: bool = False) -> None:
         """Hard stop: mute speaker NOW, drop leftover Gemini audio, ignore echo."""
         now = time.monotonic()
@@ -1026,8 +1228,21 @@ class TitanLive:
             self._is_speaking = False
         self._interrupted = True
         self._drop_model_audio = True
+        # Safety net for full-brain mode ONLY: if this interrupt cut off a
+        # [SPEAK_NOW] reply before its own turn_complete arrived,
+        # _expect_brain_turn_complete would otherwise stay stuck True
+        # forever. Gated behind self._full_brain because _mute_brain_filler
+        # is only ever un-set inside the full-brain code path — setting it
+        # True here unconditionally (my bug, previous round) meant that in
+        # NORMAL mode, the very first barge-in permanently muted all future
+        # Gemini audio for the rest of the session with nothing left to
+        # un-mute it. That's why it went silent and stayed silent.
+        if getattr(self, "_full_brain", False):
+            self._expect_brain_turn_complete = False
+            self._mute_brain_filler = True
         self._speak_ended_at = now
         self._vad_suppress_until = now + _VAD_SUPPRESS_S
+        # ESC mutes the speaker. It does NOT stop the worker job.
 
         # Kill PortAudio buffer so ESC actually silences the speaker
         stream = self._play_stream
@@ -1096,6 +1311,32 @@ class TitanLive:
         self.ui.write_log(f"ERR: {tool_name} — {short}")
         self.speak(f"Sir, {tool_name} encountered an error. {short}")
 
+    @staticmethod
+    def _realtime_input_config():
+        """Manual activity only if the SDK has ActivityStart. Else slow server VAD."""
+        start_cls = getattr(types, "ActivityStart", None)
+        if start_cls is not None:
+            try:
+                return types.RealtimeInputConfig(
+                    automatic_activity_detection=types.AutomaticActivityDetection(
+                        disabled=True,
+                    )
+                )
+            except Exception:
+                pass
+        try:
+            return types.RealtimeInputConfig(
+                automatic_activity_detection=types.AutomaticActivityDetection(
+                    disabled=False,
+                    start_of_speech_sensitivity=types.StartSensitivity.START_SENSITIVITY_LOW,
+                    end_of_speech_sensitivity=types.EndSensitivity.END_SENSITIVITY_LOW,
+                    prefix_padding_ms=40,
+                    silence_duration_ms=1400,
+                )
+            )
+        except Exception:
+            return None
+
     def _build_config(self) -> types.LiveConnectConfig:
         from datetime import datetime
 
@@ -1143,12 +1384,46 @@ class TitanLive:
             pass
         parts.append(sys_prompt)
 
+        all_tools = list(TOOL_DECLARATIONS)
+        if getattr(self, "plugin_registry", None):
+            try:
+                all_tools.extend(self.plugin_registry.get_tool_declarations())
+            except Exception:
+                pass
+        if getattr(self, "skill_registry", None) and len(self.skill_registry) > 0:
+            try:
+                skill_index = self.skill_registry.index_for_prompt()
+                if skill_index:
+                    parts.append(skill_index)
+                all_tools.append(self.skill_registry.get_tool_declaration())
+            except Exception:
+                pass
+
+        # Stash for the NVIDIA full-brain loop regardless of mode, so
+        # toggling full_brain_mode doesn't require reconnecting differently.
+        self._all_tool_declarations = all_tools
+
+        self._full_brain = _full_brain_enabled()
+        if self._full_brain:
+            # Gemini Live becomes a pure STT/TTS relay: no tools, no
+            # planning prompt — see _SILENT_RELAY_PROMPT + _run_full_brain_turn().
+            live_system_instruction = _SILENT_RELAY_PROMPT
+            live_tools_kwarg = []   # no function_declarations at all
+            # Mute by default: any auto-reply Gemini generates from raw
+            # user speech (unavoidable — VAD triggers generation regardless
+            # of the prompt) stays silent until _run_full_brain_turn()
+            # explicitly unmutes it for the [SPEAK_NOW] answer.
+            self._mute_brain_filler = True
+        else:
+            live_system_instruction = "\n".join(parts)
+            live_tools_kwarg = [{"function_declarations": all_tools}]
+
         cfg_kwargs = dict(
             response_modalities=["AUDIO"],
             output_audio_transcription={},
             input_audio_transcription={},
-            system_instruction="\n".join(parts),
-            tools=[{"function_declarations": TOOL_DECLARATIONS}],
+            system_instruction=live_system_instruction,
+            tools=live_tools_kwarg,
             speech_config=types.SpeechConfig(
                 voice_config=types.VoiceConfig(
                     prebuilt_voice_config=types.PrebuiltVoiceConfig(
@@ -1161,18 +1436,11 @@ class TitanLive:
                 thinking_budget=0,
                 include_thoughts=False,
             ),
-            # ── Latency fix #2: end-of-turn / VAD detection ───────────────────
-            realtime_input_config=types.RealtimeInputConfig(
-                automatic_activity_detection=types.AutomaticActivityDetection(
-                    disabled=False,
-                    start_of_speech_sensitivity=types.StartSensitivity.START_SENSITIVITY_HIGH,
-                    end_of_speech_sensitivity=types.EndSensitivity.END_SENSITIVITY_HIGH,
-                    prefix_padding_ms=20,
-                    silence_duration_ms=300,
-                )
-            ),
         )
-        # Long sessions (your 20-min capstone chat) otherwise 1011-crash
+        _rt = self._realtime_input_config()
+        if _rt is not None:
+            cfg_kwargs["realtime_input_config"] = _rt
+        # Long sessions (sliding window compression so sessions never 1011-crash)
         try:
             cfg_kwargs["context_window_compression"] = types.ContextWindowCompressionConfig(
                 sliding_window=types.SlidingWindow(),
@@ -1180,6 +1448,16 @@ class TitanLive:
             )
         except Exception:
             pass
+        # Live voice upgrades: session resumption, context compression, affective dialog
+        try:
+            cfg_kwargs["session_resumption"] = types.SessionResumptionConfig()
+        except Exception:
+            pass
+        if getattr(self, "_enhanced_live", True):
+            try:
+                cfg_kwargs["enable_affective_dialog"] = True
+            except Exception:
+                pass
         return types.LiveConnectConfig(**cfg_kwargs)
 
     async def _run_deep_think(self, task: str) -> str:
@@ -1224,12 +1502,169 @@ class TitanLive:
             print(f"[DeepThink] ❌ {e}")
             return f"I ran into an issue while thinking that through: {e}"
 
+    async def _deliver_midtask_speech(self) -> None:
+        """After a tool returns, give Gemini the words the user said during it."""
+        st = self._busy_vad
+        if st.get("in_speech") and st.get("voiced", 0) >= _VAD_BUSY_MIN_SPEECH and self._midtask_pcm:
+            self._pending_midtask = bytes(self._midtask_pcm)
+        pcm = self._pending_midtask or b""
+        self._pending_midtask = b""
+        self._reset_midtask()
+        try:
+            from task_control import clear_cancel
+            clear_cancel()
+        except Exception:
+            pass
+        if not pcm or not self.session:
+            return
+        print(f"[TITAN] 🎤 delivering mid-task speech ({len(pcm)} bytes)")
+        try:
+            await self.session.send_client_content(
+                turns={"parts": [{"text": (
+                    "[SYSTEM] User spoke WHILE you were working. "
+                    "If the tool said STOPPED, the file was NOT saved. "
+                    "Their voice follows. Obey it. "
+                    "stop / wait / don't touch → do not call the same tool again. "
+                    "A specific change → only that change. "
+                    "Do not restart the old job unless they say continue."
+                )}]},
+                turn_complete=False,
+            )
+        except Exception as e:
+            print(f"[TITAN] midtask text: {e}")
+        start_cls = getattr(types, "ActivityStart", None)
+        end_cls = getattr(types, "ActivityEnd", None)
+        try:
+            if start_cls is not None:
+                await self.session.send_realtime_input(activity_start=start_cls())
+            step = 4096
+            for i in range(0, len(pcm), step):
+                await self.session.send_realtime_input(
+                    audio=types.Blob(data=pcm[i:i + step], mime_type=_AUDIO_MIME)
+                )
+            if end_cls is not None:
+                await self.session.send_realtime_input(activity_end=end_cls())
+            else:
+                await self.session.send_realtime_input(audio_stream_end=True)
+        except Exception as e:
+            print(f"[TITAN] midtask audio: {e}")
+
+    def _looks_like_noise(self, text: str) -> bool:
+        """Filters out mic false-triggers before they burn an NVIDIA call.
+        Real Gemini transcripts of silence/background noise commonly come
+        back as bracketed placeholders like '[noise]', '<noise>', '...',
+        or near-empty strings — not real speech."""
+        t = text.strip().strip(".").strip()
+        if len(t) < 2:
+            return True
+        stripped = t.strip("[]<>() ").lower()
+        if stripped in ("noise", "silence", "music", "inaudible", "unclear", "blank_audio"):
+            return True
+        return False
+
+    async def _run_full_brain_turn(self, user_text: str) -> None:
+        """Full-brain mode entry point: NVIDIA plans + calls tools, Gemini
+        Live only speaks the final result. Triggered from _receive_audio()
+        when a user turn's transcript is finalized (sc.turn_complete).
+
+        Two things this guards against, both seen in real sessions:
+          1. Overlap — if a second turn fires while one is still running
+             (e.g. a stray VAD trigger), concurrent tasks would interleave
+             writes into the shared self._nvidia_history and corrupt the
+             tool_call/tool_response pairing NVIDIA expects. A lock forces
+             turns to run one at a time; a turn that arrives mid-brain is
+             dropped (not queued) since queuing would mean answering a
+             stale question seconds later.
+          2. Gemini talking over itself — Gemini Live auto-generates SOME
+             reply the instant VAD marks turn_complete, regardless of the
+             "silent relay" system prompt (prompting can't fully suppress
+             that, it's the API's own turn-boundary behaviour). We can't
+             stop it from generating, but we CAN stop it from being heard:
+             self._mute_brain_filler mutes PLAYBACK ONLY of that auto-reply
+             (a dedicated flag — NOT self._drop_model_audio, which is also
+             checked on the send side to suppress activity_end after an
+             ESC interrupt; reusing it here would silently stop us from
+             ever telling Gemini a user turn ended, breaking transcription).
+             Un-muted only for the turn we ourselves inject below.
+        """
+        if not user_text or not user_text.strip():
+            return
+        if self._looks_like_noise(user_text):
+            print(f"[NvidiaBrain] ignoring noise-like transcript: {user_text!r}")
+            return
+
+        if self._brain_lock is None:
+            self._brain_lock = asyncio.Lock()
+        if self._brain_lock.locked():
+            print(f"[NvidiaBrain] already thinking — dropping overlapping turn: {user_text!r}")
+            return
+
+        async with self._brain_lock:
+            # Mute whatever filler Gemini's own auto-reply generates for
+            # this raw-speech turn; only the [SPEAK_NOW] reply should play.
+            self._mute_brain_filler = True
+            self.ui.set_state("THINKING")
+            try:
+                answer = await run_brain_turn(
+                    user_text=user_text,
+                    history=self._nvidia_history,
+                    tool_executor=self._execute_tool_by_name,
+                    gemini_tool_declarations=self._all_tool_declarations,
+                    system_prompt=(
+                        f"You are {self._asst_name}, a professional voice assistant with "
+                        "real tool access (files, run_command, skills, web, jobs, etc). "
+                        "Plan silently, call whatever tools the task needs, verify results "
+                        "before claiming success, then answer in a short, natural, spoken "
+                        "style — this text will be read aloud, not displayed, so no markdown "
+                        "or headers."
+                    ),
+                )
+            except Exception as e:
+                print(f"[NvidiaBrain] turn failed: {e}")
+                traceback.print_exc()
+                answer = "I hit an error reaching the planning model, sir — please check the NVIDIA API key and try again."
+
+            session = self.session
+            if not session:
+                self._mute_brain_filler = True
+                return
+            try:
+                # Unmute right before injecting — this is the ONLY generation
+                # in full-brain mode that should actually reach the speaker.
+                # DO NOT re-mute here: send_client_content() returns as soon
+                # as the message is SENT, not after Gemini finishes streaming
+                # the spoken reply back (that arrives seconds later as
+                # separate response.data/turn_complete events in the recv
+                # loop). Re-muting right after this await — which the old
+                # code did in a `finally` block — silenced the real answer
+                # before it ever played. We stay unmuted until the recv
+                # loop sees THIS turn's turn_complete (flag set below) and
+                # re-arms muting there instead. See _receive_audio().
+                self._expect_brain_turn_complete = True
+                self._mute_brain_filler = False
+                await session.send_client_content(
+                    turns={"parts": [types.Part.from_text(text=f"[SPEAK_NOW] {answer}")]},
+                    turn_complete=True,
+                )
+            except Exception as e:
+                print(f"[NvidiaBrain] failed to hand answer back to Gemini Live: {e}")
+                self._expect_brain_turn_complete = False
+                self._mute_brain_filler = True
+
     async def _dispatch_tools(self, tool_call) -> None:
         """Run tools without blocking the websocket receive loop."""
         if self._tool_lock is None:
             self._tool_lock = asyncio.Lock()
         async with self._tool_lock:
+            try:
+                from task_control import clear_cancel
+                clear_cancel()
+            except Exception:
+                pass
+            self._pending_midtask = b""
+            self._reset_midtask()
             self._tool_busy = True
+            interrupted = False
             try:
                 fn_responses = []
                 for fc in tool_call.function_calls:
@@ -1240,15 +1675,37 @@ class TitanLive:
                     await self.session.send_tool_response(
                         function_responses=fn_responses
                     )
+                    names = [getattr(fc, "name", "") for fc in tool_call.function_calls]
+                    try:
+                        from task_control import is_cancelled
+                        interrupted = bool(is_cancelled()) or bool(self._pending_midtask) or bool(self._busy_vad.get("in_speech"))
+                    except Exception:
+                        interrupted = bool(self._pending_midtask)
+
             except Exception as e:
                 print(f"[TITAN] ❌ tool dispatch: {e}")
                 traceback.print_exc()
             finally:
                 self._tool_busy = False
+            await self._deliver_midtask_speech()
 
     async def _execute_tool(self, fc) -> types.FunctionResponse:
-        name = fc.name
-        args = dict(fc.args or {})
+        """Gemini-Live path: unwrap the SDK's FunctionCall object and hand off
+        to the shared dispatcher, then re-wrap as a Gemini FunctionResponse."""
+        result = await self._execute_tool_by_name(fc.name, dict(fc.args or {}), call_id=fc.id)
+        return types.FunctionResponse(id=fc.id, name=fc.name, response={"result": result})
+
+    async def _execute_tool_by_name(self, name: str, raw_args: dict, call_id: str = "brain") -> str:
+        """Shared tool dispatcher — the ONLY place tool names get routed to
+        real implementations. Callable from two places:
+          1. _execute_tool() above, for the Gemini-Live path (fc.name/fc.args).
+          2. core/nvidia_brain.py's agent loop, directly by (name, args) —
+             NVIDIA decides the tool call, this function still does the work.
+        Returns the plain result string (not a FunctionResponse) so both
+        callers can wrap it however their protocol needs.
+        """
+        # DeepSeek Pre-Execute Pipeline (Path Expansion & Arg Sanitization)
+        args = main_agent_loop.pre_step(name, raw_args)
 
         print(f"[TITAN] 🔧 {name}  {args}")
         self.ui.set_state("THINKING")
@@ -1262,16 +1719,125 @@ class TitanLive:
                 print(f"[Memory] 💾 save_memory: {category}/{key} = {value}")
             if not self.ui.muted:
                 self.ui.set_state("LISTENING")
-            return types.FunctionResponse(
-                id=fc.id, name=name,
-                response={"result": "Memory saved. Do not repeat what you just said."}
-            )
+            return "Memory saved. Do not repeat what you just said."
 
         loop   = asyncio.get_event_loop()
         result = "Done."
 
         try:
-            if name == "open_app":
+            if name == "todo_write":
+                action = args.get("action", "")
+                if action == "set_plan":
+                    result = todo_engine.set_plan(args.get("title", "Plan"), args.get("steps", []))
+                elif action == "update_step":
+                    result = todo_engine.update_step(args.get("step_id", 1), args.get("status", "in_progress"), args.get("details", ""))
+                else:
+                    result = f"Unknown todo action: {action}"
+
+            elif name == "todo_read":
+                result = todo_engine.get_summary()
+
+            elif name == "schedule":
+                dur = float(args.get("duration_seconds", 10))
+                prompt = args.get("prompt", "Reminder")
+                result = scheduler.add_timer(prompt, dur)
+
+            elif name == "set_goal":
+                desc = args.get("description", "")
+                rounds = int(args.get("max_rounds", 10))
+                result = goal_manager.set_goal(desc, rounds)
+
+            elif name == "complete_goal":
+                outcome = args.get("outcome", "Done")
+                result = goal_manager.complete_goal(outcome)
+
+            elif name == "ask_user_question":
+                q = args.get("question", "")
+                header = args.get("header", "")
+                options = args.get("options", [])
+                result = interaction_engine.ask(q, header=header, options=options)
+
+            elif name == "enter_plan_mode":
+                goal = args.get("goal", "")
+                result = plan_mode.enter_plan_mode(goal)
+
+            elif name == "exit_plan_mode":
+                summary = args.get("summary", "")
+                result = plan_mode.exit_plan_mode(summary)
+
+            elif name == "workflow_start":
+                desc = args.get("task_description", "")
+                max_iter = int(args.get("max_iterations", 3))
+                result = workflow_engine.ralph_loop(desc, max_iterations=max_iter)
+
+            elif name == "job_list":
+                result = json.dumps(job_registry.list_jobs(), indent=2)
+
+            elif name == "job_output":
+                jid = args.get("job_id", "")
+                result = job_registry.read_output(jid)
+
+            elif name == "job_kill":
+                jid = args.get("job_id", "")
+                reason = args.get("reason", "Cancelled by user")
+                result = job_registry.kill_job(jid, reason)
+
+            elif name == "invoke_subagent":
+                task = args.get("task", "")
+                role = args.get("role", "specialist")
+                result = subagent_engine.spawn(task, role=role)
+
+            elif name == "list_subagents":
+                result = json.dumps(subagent_engine.list_agents(), indent=2)
+
+            elif name == "send_subagent_message":
+                aid = args.get("subagent_id", "")
+                msg = args.get("message", "")
+                result = subagent_engine.send_message(aid, msg)
+
+            elif name == "interrupt_subagent":
+                aid = args.get("subagent_id", "")
+                result = subagent_engine.interrupt(aid)
+
+            elif name == "read_file":
+                p = args.get("path", "")
+                offset = int(args.get("offset_lines", 1))
+                max_l = int(args.get("max_lines", 250))
+                result = read_file(p, offset_lines=offset, max_lines=max_l)
+
+            elif name == "write_file":
+                p = args.get("path", "")
+                content = args.get("content", "")
+                result = write_file(p, content)
+
+            elif name == "str_replace_editor":
+                p = args.get("path", "")
+                old_s = args.get("old_str", "")
+                new_s = args.get("new_str", "")
+                result = str_replace_editor(p, old_s, new_s)
+
+            elif name == "grep_search":
+                q = args.get("query", "")
+                spath = args.get("search_path", ".")
+                is_re = bool(args.get("is_regex", False))
+                result = grep_search(q, search_path=spath, is_regex=is_re)
+
+            elif name == "glob_search":
+                pat = args.get("pattern", "")
+                spath = args.get("search_path", ".")
+                result = glob_search(pat, search_path=spath)
+
+            elif name == "python_eval":
+                code = args.get("code", "")
+                tout = int(args.get("timeout", 30))
+                result = json.dumps(run_python_code(code, timeout=tout), indent=2)
+
+            elif name == "web_fetch":
+                url = args.get("url", "")
+                max_c = int(args.get("max_chars", 12000))
+                result = await loop.run_in_executor(None, lambda: web_fetch(url, max_chars=max_c))
+
+            elif name == "open_app":
                 r = await loop.run_in_executor(None, lambda: open_app(parameters=args, response=None, player=self.ui))
                 result = r or f"Opened {args.get('app_name')}."
 
@@ -1388,12 +1954,6 @@ class TitanLive:
                     r = f"Unknown action: {action}"
                 result = r or "Done."
 
-            elif name == "smart_task":
-                import task_planner
-                api_key = _get_api_key()
-                r = await loop.run_in_executor(None, lambda: task_planner.run_smart_task(args, api_key))
-                result = r or "Done."
-
             elif name == "computer_control":
                 r = await loop.run_in_executor(None, lambda: computer_control(parameters=args, player=self.ui))
                 result = r or "Done."
@@ -1418,68 +1978,6 @@ class TitanLive:
                 r = await loop.run_in_executor(None, get_system_status)
                 result = str(r)
 
-            elif name == "skill_engine":
-                action = (args.get("action") or "list_skills").strip()
-                s_name = (args.get("skill_name") or "").strip()
-                code   = args.get("python_code") or ""
-                extra_pkgs = args.get("packages") or []
-                if isinstance(extra_pkgs, str):
-                    extra_pkgs = [p.strip() for p in extra_pkgs.replace(",", " ").split() if p.strip()]
-
-                if action in ("create_skill", "edit_skill"):
-                    r = await loop.run_in_executor(
-                        None,
-                        lambda: skill_engine.create_and_test_skill(
-                            s_name or "custom_task",
-                            code,
-                            extra_packages=list(extra_pkgs) if extra_pkgs else None,
-                        ),
-                    )
-                    result = str(r)
-                elif action == "test_skill":
-                    r = await loop.run_in_executor(None, lambda: skill_engine.test_skill(s_name))
-                    result = str(r)
-                elif action == "install_deps":
-                    r = await loop.run_in_executor(
-                        None, lambda: skill_engine.install_deps(list(extra_pkgs), skill_name=s_name)
-                    )
-                    result = str(r)
-                elif action == "run_command":
-                    cmd = args.get("command") or ""
-                    r = await loop.run_in_executor(None, lambda: skill_engine.run_command(cmd))
-                    result = str(r)
-                elif action == "skill_info":
-                    r = await loop.run_in_executor(None, lambda: skill_engine.skill_info(s_name))
-                    result = str(r)
-                elif action == "delete_skill":
-                    r = await loop.run_in_executor(None, lambda: skill_engine.delete_skill(s_name))
-                    result = str(r)
-                elif action == "get_code":
-                    r = await loop.run_in_executor(None, lambda: skill_engine.get_skill_code(s_name))
-                    result = str(r)
-                elif action == "execute_skill":
-                    f_name = args.get("function_name", "")
-                    kw = args.get("kwargs", {})
-                    if not isinstance(kw, dict):
-                        kw = {}
-                    for k, v in args.items():
-                        if k not in (
-                            "action", "skill_name", "function_name", "kwargs", "name",
-                            "python_code", "packages", "command",
-                        ):
-                            kw.setdefault(k, v)
-                    r = await loop.run_in_executor(None, lambda: skill_engine.execute_skill(s_name, f_name, **kw))
-                    result = str(r)
-                else:
-                    try:
-                        skills_list = skill_engine.list_skills_detailed()
-                    except Exception:
-                        skills_list = skill_engine.list_skills()
-                    result = (
-                        f"Available custom skills: {skills_list}"
-                        if skills_list else
-                        "No custom skills created yet. Use create_skill to invent one."
-                    )
 
             elif name == "get_clock":
                 result = get_live_clock()
@@ -1500,6 +1998,36 @@ class TitanLive:
                     result = "No task provided to think through."
                 else:
                     result = await self._run_deep_think(task)
+
+            elif name == "run_complex_task":
+                task = args.get("task", "").strip()
+                if not task:
+                    result = "No task provided to run_complex_task."
+                else:
+                    # Fresh, isolated history per call — this tool is meant
+                    # for a self-contained piece of work, not an ongoing
+                    # conversation, so it doesn't touch self._nvidia_history
+                    # (that's reserved for full_brain_mode's session-wide loop).
+                    # Exclude itself from the tool list NVIDIA gets, so it
+                    # can't call run_complex_task on itself and recurse forever.
+                    sub_tools = [t for t in self._all_tool_declarations if t.get("name") != "run_complex_task"]
+                    try:
+                        result = await run_brain_turn(
+                            user_text=task,
+                            history=[],
+                            tool_executor=self._execute_tool_by_name,
+                            gemini_tool_declarations=sub_tools,
+                            system_prompt=(
+                                "You are a careful task-execution model with real tool access "
+                                "(files, run_command, skills, web, jobs, etc). Complete the task "
+                                "below fully — call whatever tools are needed, verify results before "
+                                "claiming success, retry on failure. When done, reply with a short, "
+                                "plain-language summary of what you did and the result, suitable to "
+                                "be read aloud — no markdown, no headers."
+                            ),
+                        )
+                    except Exception as e:
+                        result = f"run_complex_task failed to reach the planning model: {e}"
 
             elif name == "manage_monitor":
                 action = args.get("action", "").lower().strip()
@@ -1529,24 +2057,110 @@ class TitanLive:
                     await asyncio.sleep(1.5)
                     import os as _os
                     _os._exit(0)
-                asyncio.create_task(_do_shutdown())
+
+            elif name == "load_skill":
+                skill_name = args.get("skill_name", "").strip()
+                if getattr(self, "skill_registry", None):
+                    result = await loop.run_in_executor(
+                        None, lambda: self.skill_registry.load(skill_name)
+                    )
+                else:
+                    result = "Skill registry is not available."
+
+            elif name == "run_command":
+                cmd = args.get("cmd", "")
+                cwd = args.get("cwd") or str(BASE_DIR)  # default to project root, not the
+                                                          # process's arbitrary launch cwd —
+                                                          # this is what made relative skill
+                                                          # script paths break silently.
+                timeout = int(args.get("timeout") or 30)
+                if not cmd:
+                    result = "No command provided."
+                else:
+                    # NOTE: run_command() itself now auto-swaps a bare "python"
+                    # for the resolved sandbox/project interpreter internally
+                    # (see core/exec.py's _resolve_python) — no need to do that
+                    # swap here too.
+                    _cmd = cmd
+                    r = await loop.run_in_executor(
+                        None, lambda: run_command(_cmd, cwd=cwd, timeout=timeout)
+                    )
+                    self._log_action(name, args)
+                    result = (
+                        f"exit_code={r['exit_code']}\n"
+                        f"stdout:\n{r['stdout'][-4000:]}\n"
+                        f"stderr:\n{r['stderr'][-2000:]}"
+                    )
+                    # Show the user what TITAN just ran — this is the whole
+                    # point of the workspace overlay: visibility without
+                    # them needing to type anything or open it manually.
+                    try:
+                        fname = _cmd.split()[-1] if isinstance(_cmd, str) else str(_cmd)
+                        code_preview = ""
+                        try:
+                            script_path = _cmd.split()[-1] if isinstance(_cmd, str) else ""
+                            if script_path and Path(script_path).is_file():
+                                code_preview = Path(script_path).read_text(encoding="utf-8", errors="ignore")[:6000]
+                        except Exception:
+                            pass
+                        self.ui._editor_sig.emit(
+                            Path(fname).name, code_preview,
+                            f"$ {cmd}\n{r['stdout']}\n{r['stderr']}",
+                        )
+                    except Exception:
+                        pass
+
+            elif getattr(self, "plugin_registry", None) and self.plugin_registry.has(name):
+                r = await loop.run_in_executor(
+                    None,
+                    lambda: self.plugin_registry.run(name, args, player=self.ui, session_memory=None),
+                )
+                result = r or "Done."
 
             else:
                 result = f"Unknown tool: {name}"
 
+            result = _finalize(result)
+            self._log_action(name, args)
+
         except Exception as e:
             result = f"Tool '{name}' failed: {e}"
             traceback.print_exc()
-            self.speak_error(name, e)
+            try:
+                self.ui.write_log(f"ERR: {name} — {str(e)[:120]}")
+            except Exception:
+                pass
+
+        if name in _WORK_TOOLS:
+            try:
+                absorb_work_output(name, args, result)
+            except Exception as e:
+                print(f"[WorkPad] absorb: {e}")
+            # Do NOT append KEEP WORKING / resume brief. That made Titan
+            # start leftover pad jobs (speedtest, format PDF) in a loop.
+            if _looks_tool_error(str(result)):
+                result = (
+                    str(result)
+                    + "\n\n[FIX THIS] Only retry if THIS tool is what the user just asked for. "
+                    "Do not start a different leftover job."
+                )
+
+        # DeepSeek Post-Execute Pipeline (Error Guard, Spill Engine & Event Logging)
+        step_result = main_agent_loop.post_step(name, args, result)
+        result = step_result["content"]
+        session_logger.record_event("tool_call", {
+            "tool": name,
+            "args": args,
+            "result": str(result)[:300],
+            "ok": step_result["ok"],
+            "was_spilled": step_result.get("was_spilled", False),
+        })
 
         if not self.ui.muted:
             self.ui.set_state("LISTENING")
 
         print(f"[TITAN] 📤 {name} → {str(result)[:80]}")
-        return types.FunctionResponse(
-            id=fc.id, name=name,
-            response={"result": result}
-        )
+        return result
 
     async def _send_realtime(self):
         """Push mic packets the instant they arrive. No 12-second backlog."""
@@ -1558,7 +2172,15 @@ class TitanLive:
                 continue
             kind = item.get("kind", "audio")
             try:
-                if kind == "audio":
+                if kind == "activity_start":
+                    start_cls = getattr(types, "ActivityStart", None)
+                    if start_cls is not None:
+                        try:
+                            await session.send_realtime_input(activity_start=start_cls())
+                            print("[TITAN] 📡 activity_start")
+                        except Exception as e:
+                            print(f"[TITAN] ⚠️ activity_start: {e}")
+                elif kind == "audio":
                     data = item.get("data")
                     if not data:
                         continue
@@ -1568,6 +2190,7 @@ class TitanLive:
                             mime_type=_AUDIO_MIME,
                         )
                     )
+                    self._user_audio_sent_at = time.monotonic()
                 elif kind == "end":
                     # ESC / interrupt must NOT trigger a new Gemini reply
                     if self._drop_model_audio or self._interrupted:
@@ -1577,12 +2200,22 @@ class TitanLive:
                     if (now - self._last_stream_end) < _END_DEBOUNCE_S:
                         print("[TITAN] 📡 skip audio_stream_end (debounce)")
                         continue
-                    await session.send_realtime_input(audio_stream_end=True)
+                    end_cls = getattr(types, "ActivityEnd", None)
+                    sent = False
+                    if end_cls is not None:
+                        try:
+                            await session.send_realtime_input(activity_end=end_cls())
+                            sent = True
+                            print("[TITAN] 📡 activity_end")
+                        except Exception as e:
+                            print(f"[TITAN] ⚠️ activity_end: {e}")
+                    if not sent:
+                        await session.send_realtime_input(audio_stream_end=True)
+                        print("[TITAN] 📡 audio_stream_end")
                     self._last_stream_end = now
                     self._vad_end_t = now
                     self._first_audio_logged = False
-                    _dbg("SEND", "audio_stream_end (local VAD)")
-                    print("[TITAN] 📡 audio_stream_end")
+                    _dbg("SEND", "turn end (local VAD)")
             except Exception as e:
                 print(f"[TITAN] ⚠️ send_realtime: {e}")
 
@@ -1594,7 +2227,7 @@ class TitanLive:
             np = None
 
         preroll: deque = deque(maxlen=_VAD_PREROLL)
-        state = {"in_speech": False, "silence": 0, "voiced": 0}
+        state = {"in_speech": False, "silence": 0, "voiced": 0, "started_at": 0.0}
 
         def _rms(indata) -> float:
             if np is None:
@@ -1607,6 +2240,13 @@ class TitanLive:
             except Exception:
                 return 0.0
 
+        def _reset_vad():
+            state["in_speech"] = False
+            state["silence"] = 0
+            state["voiced"] = 0
+            state["started_at"] = 0.0
+            preroll.clear()
+
         def callback(indata, frames, time_info, status):
             with self._speaking_lock:
                 titan_speaking = self._is_speaking
@@ -1617,19 +2257,27 @@ class TitanLive:
             rms = _rms(indata)
             now = time.monotonic()
 
-            if rms >= _VAD_START_RMS:
-                self._last_user_speech = now
-
-            if (
+            echo_gate = (
                 titan_speaking
                 or (now - self._speak_ended_at) < _ECHO_TAIL_S
                 or now < self._vad_suppress_until
-            ):
-                state["in_speech"] = False
-                state["silence"] = 0
-                state["voiced"] = 0
-                preroll.clear()
+            )
+            if echo_gate:
+                # Never count speaker bleed as "user just spoke"
+                if state["in_speech"] and state.get("voiced", 0) >= _VAD_MIN_SPEECH:
+                    started = state.get("started_at") or 0.0
+                    if started and started < (self._speak_started_at or now):
+                        self._qput_audio({"kind": "end"})
+                        print("[TITAN] 🎤 speech end (Titan started talking)")
+                _reset_vad()
                 return
+
+            # Talking is for the BOSS. It must NOT auto-kill the worker.
+            # Only echo (Titan's own speaker) is gated. Hello / stop / pause
+            # go to Gemini; the boss then calls job_board stop|pause|go_ahead.
+
+            if rms >= _VAD_START_RMS:
+                self._last_user_speech = now
 
             data = indata.tobytes()
             packet = {"kind": "audio", "data": data, "rms": rms}
@@ -1640,11 +2288,13 @@ class TitanLive:
                     state["in_speech"] = True
                     state["silence"] = 0
                     state["voiced"] = 1
+                    state["started_at"] = now
                     # New real utterance — allow Gemini audio again
                     self._interrupted = False
                     self._drop_model_audio = False
                     _dbg("VAD", f"speech start RMS={rms:.0f}")
                     print(f"[TITAN] 🎤 speech start RMS={rms:.0f}")
+                    self._qput_audio({"kind": "activity_start"})
                     for p in preroll:
                         self._qput_audio(p)
                     preroll.clear()
@@ -1660,18 +2310,13 @@ class TitanLive:
                         and state.get("voiced", 0) >= _VAD_MIN_SPEECH
                     ):
                         self._qput_audio({"kind": "end"})
-                        state["in_speech"] = False
-                        state["silence"] = 0
-                        state["voiced"] = 0
-                        preroll.clear()
+                        _reset_vad()
                         _dbg("VAD", "speech end")
                         print("[TITAN] 🎤 speech end")
                     elif state["silence"] >= _VAD_END_SILENCE:
-                        # Click / echo — not a real utterance
-                        state["in_speech"] = False
-                        state["silence"] = 0
-                        state["voiced"] = 0
-                        preroll.clear()
+                        # Click / echo / short noise — close open activity turn
+                        self._qput_audio({"kind": "end"})
+                        _reset_vad()
 
         try:
             with sd.InputStream(
@@ -1697,8 +2342,11 @@ class TitanLive:
                 async for response in self.session.receive():
 
                     if response.data:
-                        if self._drop_model_audio:
+                        if self._drop_model_audio or self._mute_brain_filler:
                             continue
+                        # Gate the mic the instant audio arrives — don't wait
+                        # for the play loop, or speaker echo (RMS 3000+) becomes "user speech".
+                        self.set_speaking(True)
                         if self._vad_end_t and not self._first_audio_logged:
                             dt = time.monotonic() - self._vad_end_t
                             print(f"[TITAN] ⚡ first audio in {dt:.2f}s")
@@ -1714,13 +2362,20 @@ class TitanLive:
                     if response.server_content:
                         sc = response.server_content
 
-                        # Server-side Gemini Live barge-in signal
+                        # Server barge-in is almost always Titan's own speaker.
+                        # Only honour it if we actually sent USER mic recently.
                         if getattr(sc, "interrupted", False):
-                            _dbg("RECV", "✋ Gemini barge-in signal received")
-                            print("[TITAN] ✋ Gemini Live detected user barge-in — stopping speech")
-                            self.interrupt()
+                            heard_user = (time.monotonic() - self._user_audio_sent_at) < 1.6
+                            with self._speaking_lock:
+                                is_spk = self._is_speaking
+                            if heard_user and not is_spk:
+                                _dbg("RECV", "✋ Gemini barge-in signal received")
+                                print("[TITAN] ✋ Gemini Live detected user barge-in — stopping speech")
+                                self.interrupt()
+                            else:
+                                print("[TITAN] 🔇 ignore barge-in (echo / Titan still speaking)")
 
-                        if sc.output_transcription and sc.output_transcription.text:
+                        if sc.output_transcription and sc.output_transcription.text and not self._mute_brain_filler:
                             txt = _clean_transcript(sc.output_transcription.text)
                             if txt and txt != (out_buf[-1] if out_buf else ""):
                                 out_buf.append(txt)
@@ -1729,18 +2384,26 @@ class TitanLive:
                         if sc.input_transcription and sc.input_transcription.text:
                             txt = _clean_transcript(sc.input_transcription.text)
                             if txt:
-                                _dbg("RECV", f"👤 Gemini heard you say: '{txt}'")
                                 with self._speaking_lock:
                                     is_spk = self._is_speaking
-                                if is_spk:
-                                    print(f"[TITAN] ✋ User spoke: '{txt}' — stopping playback (barge-in)")
-                                    self.interrupt()
-                                in_buf.append(txt)
-                                self._last_user_speech = time.monotonic()
+                                if is_spk or (time.monotonic() - self._speak_ended_at) < _ECHO_TAIL_S:
+                                    print(f"[TITAN] 🔇 ignore heard-while-speaking (echo): '{txt[:40]}'")
+                                else:
+                                    _dbg("RECV", f"👤 Gemini heard you say: '{txt}'")
+                                    in_buf.append(txt)
+                                    self._last_user_speech = time.monotonic()
 
                         if sc.turn_complete:
                             if self._turn_done_event:
                                 self._turn_done_event.set()
+
+                            # Re-arm muting exactly here — this turn_complete is
+                            # for the [SPEAK_NOW] answer we just finished playing,
+                            # so it's now safe to mute Gemini's next raw-speech
+                            # filler again without cutting off the real answer.
+                            if self._expect_brain_turn_complete:
+                                self._expect_brain_turn_complete = False
+                                self._mute_brain_filler = True
 
                             full_in = " ".join(in_buf).strip()
                             if full_in:
@@ -1752,6 +2415,13 @@ class TitanLive:
                                         "text": full_in,
                                         "ts": datetime.now().isoformat(),
                                     }))
+                                # Full-brain mode: Gemini has no tools and was told to
+                                # stay silent on raw speech — NVIDIA does the actual
+                                # planning/tool work, then we hand its answer back to
+                                # Gemini (as [SPEAK_NOW]) to voice. Don't trigger this
+                                # for our own injected [SPEAK_NOW] echoes.
+                                if getattr(self, "_full_brain", False) and not full_in.startswith("[SPEAK_NOW]"):
+                                    asyncio.create_task(self._run_full_brain_turn(full_in))
                             in_buf = []
 
                             full_out = " ".join(out_buf).strip()
@@ -1860,12 +2530,30 @@ class TitanLive:
                     continue
 
                 try:
+                    if stream.stopped:
+                        try:
+                            stream.start()
+                        except Exception:
+                            pass
                     await asyncio.to_thread(stream.write, bytes(batch))
-                except (RuntimeError, asyncio.CancelledError):
+                except asyncio.CancelledError:
                     break
+                except Exception as e:
+                    err = str(e)
+                    if "stopped" in err.lower() or "-9983" in err:
+                        try:
+                            stream.start()
+                        except Exception:
+                            pass
+                        self.set_speaking(False)
+                        continue
+                    print(f"[TITAN] ⚠️ play write: {err[:120]}")
+                    self.set_speaking(False)
+                    continue
         except Exception as e:
             print(f"[TITAN] ❌ Play: {e}")
-            raise
+            # Never crash the whole session because the speaker hiccuped
+            await asyncio.sleep(0.2)
         finally:
             self._play_stream = None
             self.set_speaking(False)
@@ -1922,9 +2610,26 @@ class TitanLive:
                 f" Also briefly and naturally mention that {_when}: {last['summary']}"
             )
 
+        # Ask only. Do NOT start the job. Auto-start was the task-loop bug.
+        pending_clause = ""
+        try:
+            pad = load_pad()
+            open_jobs = [j for j in (pad.get("jobs") or []) if j.get("status") in ("active", "paused")]
+            if open_jobs:
+                j = open_jobs[0]
+                nxt = _next_step(j)
+                step_txt = f" Next step would be: {nxt.get('text')}." if nxt else ""
+                pending_clause = (
+                    f" Also briefly ASK if they want you to continue the unfinished job "
+                    f"'{j.get('title') or j.get('id')}'.{step_txt} "
+                    f"Do not start it. Do not call any tools for it."
+                )
+        except Exception:
+            pass
+
         p1 = (
-            f"Greet the user warmly, mention it is {time_str}, and say you are fetching today's news now.{session_clause} "
-            f"Keep it to 2 short sentences max. Do not call any tools.{lang_clause}{name_clause}"
+            f"Greet the user warmly, mention it is {time_str}, and say you are fetching today's news now.{session_clause}{pending_clause} "
+            f"Keep it to 3 short sentences max. Do not call any tools.{lang_clause}{name_clause}"
         )
 
         # Clear the turn-done event so we can wait for Phase 1 to finish
@@ -2104,6 +2809,51 @@ class TitanLive:
 
     # ── Proactive mode ──────────────────────────────────────────────────────────
 
+
+    async def _watch_worker(self) -> None:
+        """Boss inbox: worker events appear on screen; done/failed notify the model."""
+        while True:
+            await asyncio.sleep(0.45)
+            try:
+                events = pop_events()
+            except Exception:
+                events = []
+            if not events:
+                continue
+            for ev in events:
+                kind = ev.get("kind")
+                did = ev.get("did") or ""
+                path = ev.get("path") or ""
+                try:
+                    self.ui.write_log(f"SYS: [Worker] {kind} — {did[:140]}")
+                except Exception:
+                    pass
+
+                if not self.session:
+                    continue
+
+                if kind == "done":
+                    msg = (
+                        f"[WORKER_EVENT] Job finished: {did}. Output path: {path}. "
+                        "Inform the user naturally in one brief sentence."
+                    )
+                    try:
+                        await self.session.send_client_content(
+                            turns={"parts": [{"text": msg}]},
+                            turn_complete=True,
+                        )
+                    except Exception as e:
+                        print(f"[WORKER] inject done: {e}")
+                elif kind == "failed":
+                    msg = f"[WORKER_EVENT] Job failed: {did}. Inform the user truthfully in one brief sentence."
+                    try:
+                        await self.session.send_client_content(
+                            turns={"parts": [{"text": msg}]},
+                            turn_complete=True,
+                        )
+                    except Exception as e:
+                        print(f"[WORKER] inject failed: {e}")
+
     async def _run_proactive_mode(self) -> None:
         """
         Background task: periodically checks if the user has been silent long enough,
@@ -2165,6 +2915,12 @@ class TitanLive:
             elif isinstance(chunk, (bytes, bytearray)):
                 data = bytes(chunk)
             else:
+                continue
+            if self._tool_busy:
+                try:
+                    self._on_midtask_chunk(bytes(data), 999.0)
+                except Exception:
+                    pass
                 continue
             self._qput_audio({"kind": "audio", "data": data, "rms": 999.0})
 
@@ -2279,6 +3035,15 @@ class TitanLive:
                     self._drop_model_audio     = False
                     self._vad_suppress_until   = 0.0
                     self._last_stream_end      = 0.0
+                    self._user_audio_sent_at   = 0.0
+                    self._speak_started_at     = 0.0
+                    self._pending_midtask      = b""
+                    self._reset_midtask()
+                    try:
+                        from task_control import clear_cancel
+                        clear_cancel()
+                    except Exception:
+                        pass
 
                     print("[TITAN] Connected.")
                     self.ui.set_state("LISTENING")
@@ -2294,6 +3059,7 @@ class TitanLive:
                     tg.create_task(self._run_system_monitor())
                     tg.create_task(self._run_background_monitor())
                     tg.create_task(self._run_proactive_mode())
+                    tg.create_task(self._watch_worker())
                     if self._dashboard:
                         tg.create_task(self._relay_phone_audio())
 
