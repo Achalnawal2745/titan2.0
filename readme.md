@@ -4,9 +4,16 @@
 [![Version](https://img.shields.io/badge/TITAN-2.0.0-00f0ff.svg?style=for-the-badge&logo=python)](https://github.com/Achalnawal2745/titan2.0.git)
 [![Python](https://img.shields.io/badge/Python-3.11%20%7C%203.12%20%7C%203.14-7000ff.svg?style=for-the-badge&logo=python)](https://python.org)
 [![PyQt6](https://img.shields.io/badge/UI-PyQt6%20Obsidian%20Glass-00ff9d.svg?style=for-the-badge)](https://riverbankcomputing.com)
-[![Gemini Live](https://img.shields.io/badge/AI%20Core-Gemini%20Live%20API-bc13fe.svg?style=for-the-badge&logo=google)](https://ai.google.dev)
+[![Gemini Live](https://img.shields.io/badge/Voice-Gemini%20Live%20API-bc13fe.svg?style=for-the-badge&logo=google)](https://ai.google.dev)
+[![NVIDIA Nemotron](https://img.shields.io/badge/Planner-NVIDIA%20Nemotron-3-super-120b-a12b-76b900.svg?style=for-the-badge&logo=nvidia)](https://www.nvidia.com/)
 
-TITAN 2.0 is a real-time, multimodal personal AI assistant engineered for full system automation, visual awareness, biometric security, document intelligence, dynamic skill creation, and browser interaction. Powered by the **Google Gemini Live API** for low-latency WebSocket audio streaming, TITAN operates as a persistent desktop command center capable of hearing, seeing, understanding, and controlling your PC.
+TITAN 2.0 is a real-time, multimodal personal AI assistant engineered for full system automation, visual awareness, biometric security, document intelligence, dynamic skill creation, and browser interaction.
+
+**Architecture: Two Brains, One Voice**
+- **Boss (Gemini Live)** — owns the microphone and speaker. Handles instant, one-shot requests (open apps, web search, system settings, quick answers). **Cannot** write files, run commands, or load skills.
+- **Worker (NVIDIA Nemotron)** — spawned on demand for anything that creates a file, needs code, or requires skill instructions. Has **every** tool the boss has **plus** `write_file`, `run_command`, `load_skill`, `verify_task_result`, and can ask the user clarifying questions through the boss.
+
+Powered by the **Google Gemini Live API** for low-latency WebSocket audio streaming and **NVIDIA Nemotron 3-Super** for multi-step planning and execution, TITAN operates as a persistent desktop command center capable of hearing, seeing, understanding, and controlling your PC.
 
 ---
 
@@ -77,7 +84,7 @@ TITAN 2.0 is a real-time, multimodal personal AI assistant engineered for full s
 
 ```text
 titan2.0/
-├── main.py                   # Core loop — Gemini Live WebSocket session, VAD, tool dispatcher & startup gate
+├── main.py                   # Core loop — Gemini Live WebSocket session, VAD, boss↔worker dispatcher
 ├── ui.py                     # PyQt6 HUD — obsidian glass command center, live terminal console & security modals
 ├── doc_engine.py             # Docling & Unstructured document reader and formatted Word (.docx) writer
 ├── task_planner.py           # Multi-step autonomous document reasoning & Q&A pipeline
@@ -85,12 +92,12 @@ titan2.0/
 ├── setup.py                  # Initial setup and wizard
 ├── run.bat                   # Windows launcher script with OpenBLAS memory environment constraints
 │
-├── actions/
+├── actions/                  # Boss tools (instant, one-shot) + Worker-only implementations
 │   ├── skill_engine.py       # Autonomous Skill Engine 2.0 (isolated venv sandbox, AST safety, self-testing)
 │   ├── reminder.py           # Multilingual scheduled system notifications (schtasks + timer fallback)
 │   ├── system_monitor.py     # Hardware telemetry (CPU/RAM/GPU/Temp) & voice status reporting
 │   ├── ui_automation.py      # Windows Accessibility UIA background control (zero mouse hijacking)
-│   ├── file_controller.py    # Local file system manager with safe .docx Word generator routing
+│   ├── file_controller.py    # Local file system manager (worker-only write/move/delete)
 │   ├── file_processor.py     # Local file processing engine (OCR, PDF, CSV/Excel stats, code review)
 │   ├── shadow_link.py        # Chrome DOM navigation & auto-index element resolver
 │   ├── voice_face_id.py      # GMM Speaker Voice Recognition & YuNet DNN Face ID Security
@@ -107,46 +114,107 @@ titan2.0/
 │   ├── flight_finder.py      # Flight search lookup
 │   └── youtube_video.py      # YouTube search & playback control
 │
-├── skills/                   # Persistent user & AI-generated custom Python skill modules
-│   ├── _sandbox/             # Isolated virtual environment sandbox (never modifies host packages)
-│   └── _meta/                # Skill unit-test logs & verification metadata
+├── core/                     # Shared runtime
+│   ├── nvidia_brain.py       # NVIDIA Nemotron planner → tool loop (worker brain)
+│   ├── task_workers.py       # Persistent background workers with plan/verify/ask gates
+│   ├── skill_registry.py     # Progressive-disclosure SKILL.md loader (1481 skills indexed)
+│   ├── tool_pipeline.py      # Guarded tool pipeline with spill budgets & loop hygiene
+│   ├── error_guard.py        # Loop detection + auto-repair feedback
+│   ├── spill.py              # Truncation with actionable "read with offset" guidance
+│   ├── exec.py               # Command execution with sandboxed venv resolution
+│   ├── prompt.txt            # Boss prompt (triage/relay/report only)
+│   └── ...                   # fs_tools, agent_loop, todo_engine, goal_manager, etc.
+│
+├── skills/                   # 1481 SKILL.md packages (19 advertised, 1462 via search_skills)
+│   ├── _sandbox/             # Isolated venv for AI-generated skills
+│   ├── _meta/                # Skill unit-test logs & verification metadata
+│   ├── pptx/                 # pptxgenjs v4 signatures, validate.py, OOXML references
+│   ├── docx/, xlsx/, pdf/, canvas-design/, theme-factory/, ...
+│   └── [1470+ more]
 │
 ├── titan-extension/          # Embedded Chrome Extension source & DOM inspector
 ├── memory/
 │   ├── work_pad.py           # Persistent multi-job checklist and notebook engine
 │   ├── memory_manager.py     # Persistent long-term memory store
 │   └── config_manager.py     # Central configuration manager
-├── core/
-│   └── prompt.txt            # System prompt & tool routing directives
 └── config/
     ├── titan_v3.ico          # Multi-resolution cropped emblem icon asset
-    └── api_keys.json         # API key, OS settings, assistant name, user name
+    └── api_keys.json         # API keys, OS settings, assistant/user names
 ```
 
 ---
 
-## 🛠️ Tool Registry & Function Calling Reference
+## 🛠️ Tool Registry — Boss vs Worker
 
-| Tool Name | Action / Scope | Description |
+**Boss tools** (Gemini Live — instant, speakable, no file creation):  
+`get_clock`, `system_status`, `web_search`, `web_fetch`, `read_file`, `glob_search`, `grep_search`,  
+`work_pad` (read), `reminder`, `schedule`, `send_message`, `youtube_video`,  
+`open_app`, `computer_settings`, `computer_control`, `desktop_control`, `manage_monitor`,  
+`screen_process`, `voice_face_id`, `save_memory`, `deep_think`, `browser_control`, `shadow_link`,  
+`search_skills`, `start_task_worker`, `task_worker_status`, `send_task_worker_message`,  
+`interrupt_task_worker`, `answer_worker_question`, `set_titan_microphone`, `shutdown_titan`
+
+**Worker tools** (NVIDIA Nemotron — everything the boss has **plus** file creation, code, skills):  
+*All boss tools* **plus** `load_skill`, `write_file`, `str_replace_editor`, `run_command`, `python_eval`,  
+`code_helper`, `dev_agent`, `file_processor`, `file_controller` (write/move/delete), `game_updater`,  
+`task_set_plan`, `verify_task_result`, `enter_plan_mode`, `exit_plan_mode`, `set_goal`, `complete_goal`, `ask_user_question`
+
+| Tool | Owner | Scope |
 |---|---|---|
-| `get_clock` | *None* | Returns real-time PC local date, time, weekday, timezone offset, and ISO timestamp. |
-| `work_pad` | `show` \| `add_job` \| `add_step` \| `check` \| `note` \| `edit_job` \| `clear_done` | Multi-job persistent working notebook and live on-screen Markdown checklist. |
-| `skill_engine` | `create_skill` \| `edit_skill` \| `test_skill` \| `execute_skill` \| `install_deps` \| `list_skills` | Autonomous Skill Engine with isolated sandbox venv execution and crash protection. |
-| `reminder` | `date`, `time`, `message` | Multilingual reminder scheduler with Task Scheduler and native pop-up dialogs. |
-| `system_status` | *None* | Real-time CPU, RAM, GPU, CPU temperature, uptime, and process telemetry. |
-| `ui_automation` | `click` \| `type` \| `get_text` \| `dump_tree` | **Primary** Windows desktop app interaction via UIAutomation without stealing mouse pointer. |
-| `smart_task` | `answer_questions_in_doc` \| `summarize_document` \| `rewrite_document` \| `generate_document` | Autonomous multi-step document reasoning & styled Word `.docx` report writer. |
-| `shadow_link` | `get_url` \| `click` \| `type` \| `scroll` \| `extract` | Primary Chrome web browser DOM interaction tool via WebSocket bridge. |
-| `file_processor` | `summarize` \| `ocr` \| `analyze` \| `to_word` \| `stats` | Processes uploaded files (PDFs, Word docs, CSV/Excel, images, code files). |
-| `file_controller` | `read` \| `write` \| `move` \| `copy` \| `find` \| `delete` | General file manager. Automatically routes `.docx` writes through `doc_engine`. |
-| `voice_face_id` | `enroll_face` \| `enroll_voice` \| `status` \| `toggle` | Enrolls biometric templates and toggles Master Security Lock states. |
-| `screen_process` | `screen` \| `camera` | Captures current screen or webcam feed for Gemini Live visual reasoning. |
-| `computer_settings` | `volume` \| `brightness` \| `wifi` \| `close` \| `lock_screen` | System settings controller. |
-| `computer_control` | `hotkey` \| `scroll` \| `move` | Fallback raw mouse and hotkey manager. |
+| `get_clock` | Boss | Live wall clock, weekday, timezone, ISO timestamp |
+| `system_status` | Boss | CPU, RAM, GPU, temperature, uptime |
+| `web_search` / `web_fetch` | Boss | Grounded search + clean page fetch |
+| `read_file` / `glob_search` / `grep_search` | Boss | Read-only file ops; Desktop/Downloads path expansion |
+| `open_app` / `computer_settings` / `computer_control` | Boss | Instant app launch, volume, brightness, Wi-Fi, lock |
+| `browser_control` / `shadow_link` | Boss | Open URL, click DOM element — not scraping projects |
+| `start_task_worker` | Boss | Hand off any multi-step / file-creating task |
+| `task_worker_status` / `send_task_worker_message` / `interrupt_task_worker` | Boss | Watch / steer / stop a running worker |
+| `answer_worker_question` | Boss | Relay user's answer back to a blocked worker |
+| `load_skill` | Worker | Pulls full SKILL.md (22 KB for pptx) — **never on boss** |
+| `write_file` / `str_replace_editor` / `run_command` / `python_eval` | Worker | Authoring & execution — scripts go to `scratch/` |
+| `code_helper` / `dev_agent` / `file_processor` | Worker | Code gen, dev tasks, heavy file ops |
+| `task_set_plan` / `verify_task_result` | Worker | Plan (up to 12 steps) + structural quality gate |
+| `ask_user_question` | Worker | Blocks worker; boss speaks question, relays answer |
 
 ---
 
-## ⚡ Quick Start & Installation
+## 🔄 How a Request Flows
+
+1. **You speak** → Gemini Live transcribes → Boss receives text.
+2. **Boss triages** (instant, no tools):
+   - One-shot, speakable answer? → Boss answers directly (`web_search`, `open_app`, etc.).
+   - Creates/edits a file, needs code, or multi-step? → Boss calls `start_task_worker` with the **complete** user request.
+3. **Worker starts** (NVIDIA Nemotron):
+   - Gets its own message history, full tool set, and the skill catalog index.
+   - Calls `load_skill('pptx')` → receives **full 22 KB** of design rules, gotchas, validation steps.
+   - Calls `task_set_plan` (up to 12 steps).
+   - Writes generator script to `scratch/generate_<name>.js`, runs it via `run_command`.
+   - If a command fails, reads the real error, fixes that line, retries.
+   - Calls `verify_task_result` with output paths. Gate checks:
+     - File exists and is not corrupt (OOXML ZIP valid)
+     - Size ≥ minimum plausible bytes (pptx ≥ 12 KB, docx ≥ 8 KB)
+     - ≥ 3 slides for presentations; required XML parts present
+     - **Skill was actually loaded** — building a skill-backed format without `load_skill` rejects
+4. **Worker finishes** → emits `completed` event.
+5. **Boss relays** → speaks the worker's one-sentence report to you.
+
+While the worker runs, you stay free to talk to the boss. "Is it done?" → boss calls `task_worker_status`. "Change the theme to dark" → boss calls `send_task_worker_message`. "Stop" → boss calls `interrupt_task_worker`.
+
+## 🧪 Quality Gate — `verify_task_result`
+
+The old gate only checked "file exists." The new gate rejects:
+
+- Corrupt Office files (bad ZIP, invalid XML)
+- Near-empty files (pptx < 12 KB, docx < 8 KB, xlsx < 4 KB)
+- Decks with fewer than 3 slides
+- Skill-backed formats built **without ever calling `load_skill`**
+- Charts using corrupting patterns (`#` prefix, 8-digit alpha hex)
+
+This is why the earlier "presentation.pptx" (2 slides) was rejected while "India_Presentation.pptx" passed.
+
+---
+
+## 🔒 Biometric Privacy & Security
 
 ### 1. Prerequisites
 * **OS**: Windows 10 / 11 (recommended), macOS, or Linux
@@ -161,6 +229,7 @@ cd titan2.0
 
 # Install dependencies
 pip install -r requirements.txt
+npm install  # inside titan-extension/ for Chrome extension
 
 # Launch TITAN 2.0
 python main.py
@@ -179,15 +248,26 @@ And add your API keys in `config/api_keys.json`:
   "nvidia_api_key": "YOUR_NVIDIA_API_KEY",
   "assistant_name": "TITAN",
   "user_name": "Sir",
-  "full_brain_mode": false
+  "os_system": "windows"
 }
 ```
+**Note**: `full_brain_mode` is deprecated — the worker always uses NVIDIA Nemotron; the boss is always Gemini Live.
 
 ---
 
 ## 🔒 Biometric Privacy & Security
 * **Local Biometric Stores**: Facial embeddings (`memory/owner_face.npy`) and GMM voice profiles (`memory/owner_voice_gmm.pkl`) are computed and stored 100% locally on your machine.
 * **Master Security Gate**: When Master Security Lock is enabled, desktop interaction is strictly blocked until Face ID, Voice Verification, or PIN authentication passes.
+
+---
+
+## 🛡️ Reliability Fixes (2026-08)
+
+- **read_file spill budgets**: `read_file` now gets 2000 lines / 120 KB before spilling (was 50/2.5 KB). A worker can now see its entire generator script at once, so `str_replace_editor` matches on real content instead of memory.
+- **Loop-hygiene guard reset**: A successful `write_file` / `str_replace_editor` / `run_command` clears the failure signature history, so a legitimate retry after a fix isn't blocked.
+- **HEAD/TAIL previews increased**: 60 head / 30 tail lines when spilling does occur, plus an explicit "read with offset_lines/max_lines" hint.
+- **Skill truncation removed**: `load_skill` and `search_skills` have a 60 KB cap and never spill — the worker receives the full skill body every time.
+- **Hop refunds for read-only calls**: `load_skill`, `read_file`, `grep_search`, `todo_read`, `get_clock` refund their hop (up to 8 refunds), so loading a 22 KB skill doesn't consume budget.
 
 ---
 
