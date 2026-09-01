@@ -65,6 +65,8 @@ shadow_vault/
 scratch/
 /scratch/
 scratch/*
+scratch/spill_outputs/
+scratch/__pycache__/
 uploads/
 qdrant_db/
 *.db
@@ -74,6 +76,10 @@ qdrant_db/
 *.tmp
 .DS_Store
 Thumbs.db
+
+# ── Session & Runtime Artifacts ────────────────────────────────────────────
+memory/session_events/
+*.jsonl
 
 # ── User Media & Captured Screenshots/Audio ───────────────────────────────
 *.png
