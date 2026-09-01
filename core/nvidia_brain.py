@@ -26,8 +26,10 @@ NOT silently return no answer.
 """
 from __future__ import annotations
 
+import asyncio
 import copy
 import json
+import traceback
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 import requests
@@ -43,8 +45,44 @@ from core.llm import (
 # Async (name, args) -> result string. main.py passes self._execute_tool_by_name.
 ToolExecutor = Callable[[str, dict], Awaitable[str]]
 
-MAX_TOOL_HOPS = 8          # hard ceiling per user turn — never loop forever
+MAX_TOOL_HOPS = 12         # hard ceiling per user turn - never loop forever
 REQUEST_TIMEOUT = 60
+
+# ── Tool-result size caps ────────────────────────────────────────────────────
+# A flat cap used to be applied to EVERY tool result, which silently gutted the
+# skill system: load_skill("pptx") returns ~22,700 chars and the old 6000-char
+# cap threw away 74% of it - every chart rule, every corruption warning, and the
+# "run scripts/office/validate.py" step. The worker then improvised pptxgenjs
+# from memory and produced bare default-template decks that still "passed".
+#
+# Rule: payloads the worker must FOLLOW arrive whole. Bulk observations (command
+# output, file dumps, search results) can still be clipped - but never silently;
+# a clip marker is appended so the model knows it did not see everything.
+TOOL_RESULT_CAP = 6000
+INSTRUCTION_TOOL_CAP = 60000
+INSTRUCTION_TOOLS = {"load_skill", "search_skills"}
+
+# Read-only calls that refund their hop (see the loop in run_brain_turn).
+# Capped so a model that only ever reads still terminates.
+FREE_HOP_TOOLS = {
+    "load_skill", "search_skills", "read_file", "glob_search", "grep_search",
+    "todo_read", "task_worker_status", "get_clock",
+}
+MAX_FREE_HOP_REFUNDS = 8
+
+
+def _clip_tool_result(name: str, result: Any) -> str:
+    """Cap a tool result by kind, marking the cut instead of hiding it."""
+    text = str(result)
+    cap = INSTRUCTION_TOOL_CAP if name in INSTRUCTION_TOOLS else TOOL_RESULT_CAP
+    if len(text) <= cap:
+        return text
+    dropped = len(text) - cap
+    return (
+        f"{text[:cap]}\n\n[TRUNCATED: {dropped} more characters were cut from this "
+        f"'{name}' result. You have NOT seen all of it - do not assume the rest is "
+        f"empty or unimportant. Narrow the call or read the source directly.]"
+    )
 
 
 def _gemini_schema_to_openai(gemini_decl: dict) -> dict:
@@ -136,6 +174,7 @@ async def run_brain_turn(
     system_prompt: str,
     model: str = NVIDIA_MODEL,
     temperature: float = 0.3,
+    max_tool_hops: int = MAX_TOOL_HOPS,
 ) -> str:
     """Runs the full plan -> tool-call -> observe loop for ONE user turn.
 
@@ -151,8 +190,14 @@ async def run_brain_turn(
 
     history.append({"role": "user", "content": user_text})
 
-    for hop in range(MAX_TOOL_HOPS):
-        msg = _call_nvidia(history, tools, model, temperature)
+    hop = 0
+    refunded = 0
+    while hop < max_tool_hops:
+        hop += 1
+        # requests.post is synchronous. Running it on the Live event loop
+        # prevented Gemini websocket keepalive traffic during slow planning
+        # calls, which caused 1011/ping-timeout disconnects mid-task.
+        msg = await asyncio.to_thread(_call_nvidia, history, tools, model, temperature)
         history.append(msg)
 
         tool_calls = msg.get("tool_calls") or []
@@ -167,17 +212,38 @@ async def run_brain_turn(
             except json.JSONDecodeError:
                 args = {}
 
-            print(f"[NvidiaBrain] hop {hop+1}/{MAX_TOOL_HOPS} -> tool {name}({args})")
+            print(f"[NvidiaBrain] hop {hop}/{max_tool_hops} -> tool {name}({args})")
             try:
                 result = await tool_executor(name, args)
             except Exception as e:
-                result = f"Tool '{name}' raised an exception: {e}"
+                # This used to hide real infrastructure bugs as ordinary tool
+                # failures - a UnicodeEncodeError in a debug print looked
+                # identical to "the tool ran and didn't work". Always dump the
+                # traceback so the two are distinguishable in the log.
+                print(f"[NvidiaBrain] EXECUTOR CRASH on '{name}': {e!r}")
+                traceback.print_exc()
+                result = (
+                    f"Tool '{name}' could not be executed - the dispatcher itself "
+                    f"raised {type(e).__name__}: {e}. This is a TITAN bug, not a "
+                    "problem with your arguments; do not simply retry the same call."
+                )
 
             history.append({
                 "role": "tool",
                 "tool_call_id": tc.get("id", ""),
-                "content": str(result)[:6000],   # keep context sane
+                "content": _clip_tool_result(name, result),
             })
+
+        # Reading instructions or inspecting a file is not progress spent, it is
+        # preparation. Charging it against the budget punished exactly the
+        # behaviour we want (load the skill, read the real error) and pushed the
+        # worker to start writing code blind in order to save hops.
+        if all(
+            (tc.get("function", {}) or {}).get("name", "") in FREE_HOP_TOOLS
+            for tc in tool_calls
+        ) and refunded < MAX_FREE_HOP_REFUNDS:
+            refunded += 1
+            max_tool_hops += 1
 
     # Hit MAX_TOOL_HOPS without a final answer — surface that honestly
     # instead of pretending the task is done.

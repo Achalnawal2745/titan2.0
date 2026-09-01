@@ -18,8 +18,11 @@ from typing import Any, Tuple
 # Thresholds
 MAX_INLINE_LINES = 50
 MAX_INLINE_CHARS = 2500
-HEAD_LINES = 12
-TAIL_LINES = 12
+# 12/12 left the model looking at ~24 lines of a 155-line file and guessing the
+# rest. Per-tool budgets in core/tool_pipeline.SPILL_BUDGETS keep ordinary
+# source files whole; when something really does spill, show enough to act on.
+HEAD_LINES = 60
+TAIL_LINES = 30
 
 
 def _get_spill_dir() -> Path:
@@ -69,8 +72,11 @@ def maybe_spill_output(
     omitted = len(lines) - (HEAD_LINES + TAIL_LINES)
 
     preview = (
-        f"[OUTPUT TRUNCATED — Total {len(lines)} lines, {len(text)} bytes]\n"
+        f"[OUTPUT TRUNCATED - Total {len(lines)} lines, {len(text)} bytes]\n"
         f"Full output saved to: {spill_path_str}\n"
+        f"You have NOT seen lines {HEAD_LINES + 1}-{len(lines) - TAIL_LINES}. Do not "
+        f"reconstruct them from memory - if you need to edit that region, read it "
+        f"first with read_file(path, offset_lines=N, max_lines=M).\n"
         f"--- Output Head (first {HEAD_LINES} lines) ---\n"
         f"{head}\n"
         f"--- [... {omitted} lines omitted ...] ---\n"

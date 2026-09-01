@@ -4217,14 +4217,24 @@ class MainWindow(QMainWindow):
 
     def _do_interrupt(self):
         now = time.time()
+        # A physical ESC is received through both the Qt shortcut and the
+        # global Windows hook. Treat that near-simultaneous duplicate as one
+        # press; keep the normal 500 ms window for a real double ESC.
+        last_dispatch = getattr(self, "_last_esc_dispatch", 0.0)
+        if (now - last_dispatch) < 0.08:
+            return
+        self._last_esc_dispatch = now
         last = getattr(self, "_last_esc_time", 0.0)
         self._last_esc_time = now
+        is_double_esc = (now - last) < 0.5
 
         if self.on_interrupt:
-            self.on_interrupt()
+            # Single ESC stops only speech. Double ESC also clears pending
+            # input; neither action permanently mutes the microphone.
+            self.on_interrupt(flush_mic=is_double_esc)
 
         # Double-ESC within 500ms = full mic flush + notify user
-        if (now - last) < 0.5:
+        if is_double_esc:
             self._log.append_log("SYS: ⚡ Double-ESC — full mic & queue reset.")
             print("[TITAN] ⚡ Double-ESC — full mic + speaker flush complete")
         else:
@@ -4344,16 +4354,26 @@ class TitanUI:
     def __init__(self, face_path: str, size=None):
         self._app = QApplication.instance() or QApplication(sys.argv)
         self._app.setStyle("Fusion")
+        self._alive = True
         self._win = MainWindow(face_path)
+        self._win.destroyed.connect(self._mark_closed)
         self._win.show()
         self.root = _RootShim(self._app)
 
+    def _mark_closed(self, *_args) -> None:
+        """Qt may destroy the window while background audio is unwinding."""
+        self._alive = False
+
     @property
     def muted(self) -> bool:
+        if not self._alive:
+            return True
         return self._win._muted
 
     @muted.setter
     def muted(self, v: bool):
+        if not self._alive:
+            return
         if v != self._win._muted:
             self._win._toggle_mute()
 
@@ -4389,10 +4409,12 @@ class TitanUI:
         self._win.notify_phone_connected()
 
     def set_state(self, state: str):
-        self._win._state_sig.emit(state)
+        if self._alive:
+            self._win._state_sig.emit(state)
 
     def write_log(self, text: str):
-        self._win._log_sig.emit(text)
+        if self._alive:
+            self._win._log_sig.emit(text)
 
     def refresh_security_ui(self):
         """Thread-safe: trigger main thread to refresh security UI buttons."""

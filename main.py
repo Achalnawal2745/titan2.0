@@ -148,9 +148,7 @@ from core.goal_manager import goal_manager, GOAL_TOOLS_DECLARATIONS
 from core.scheduler import scheduler, SCHEDULE_DECLARATION
 from core.interaction import interaction_engine, ASK_USER_DECLARATION
 from core.plan_mode import plan_mode, PLAN_MODE_DECLARATIONS
-from core.workflow_engine import workflow_engine, WORKFLOW_DECLARATION
 from core.jobs import job_registry, JOB_TOOLS_DECLARATIONS
-from core.subagent_engine import subagent_engine, SUBAGENT_TOOLS_DECLARATIONS
 from core.fs_tools import (
     read_file, write_file, str_replace_editor, grep_search, glob_search,
     FS_TOOLS_DECLARATIONS,
@@ -158,6 +156,18 @@ from core.fs_tools import (
 from core.code_runner import run_python_code, PYTHON_EVAL_DECLARATION
 from core.web_tools import web_fetch, WEB_FETCH_DECLARATION
 from core.nvidia_brain import run_brain_turn
+from core.task_workers import task_workers, TASK_WORKER_DECLARATIONS, running_in_worker
+# core.workflow_engine (WORKFLOW_DECLARATION/ralph_loop) and core.subagent_engine
+# (SUBAGENT_TOOLS_DECLARATIONS) are intentionally NOT imported anymore. Both were
+# earlier, half-built "do complex work" paths that ended up coexisting with
+# core.task_workers — workflow_start was pure decoration (ralph_loop just
+# returns a string, no actual execution ever happens), and invoke_subagent
+# duplicated task_workers.start() under a different name. Having 3 different
+# tool names that all mean "do multi-step work", with only some of them
+# wired to real execution, is exactly what caused "works sometimes, does
+# nothing other times" — the model was picking between them essentially at
+# random. task_workers.py is the one real, verification-gated implementation;
+# everything now points at it exclusively. See TASK_WORKER_DECLARATIONS below.
 
 
 def _finalize(raw):
@@ -256,6 +266,36 @@ _VAD_BUSY_MIN_SPEECH = 16     # ~0.5 s so a click does not cancel the job
 _WORK_TOOLS = {
     "file_controller", "run_command", "load_skill", "code_helper",
     "file_processor", "work_pad", "dev_agent", "web_search",
+}
+
+# ── Boss / worker power split ────────────────────────────────────────────────
+# The BOSS (Gemini Live) owns the voice: listen, triage, speak, and steer
+# workers. It keeps every fast one-shot action - "open Chrome", "who is X",
+# "what's my CPU at" must stay instant, and routing those through a worker
+# would add an NVIDIA round-trip plus worker spawn to a 200 ms task.
+#
+# The WORKER (core/task_workers.py, NVIDIA brain) owns everything that builds
+# something: writing files, running commands, loading skill instructions,
+# planning, verifying. It has strictly MORE power than the boss - the only
+# thing it cannot do is speak.
+#
+# This split is the enforcement mechanism, not a suggestion. Previously
+# prompt.txt merely asked the boss to hand off complex work, so whenever the
+# boss felt capable it would call write_file + run_command itself, skip the
+# skill entirely, and emit a bare default-template deck. Removing those tools
+# from the boss makes handoff the only physically available path.
+WORKER_ONLY_TOOLS = {
+    # instruction loading - the boss cannot act on skills, so it must not hold
+    # them (and the old deferred-load path bound the skill to the WRONG
+    # transcript, starting workers with tasks like the single word "no")
+    "load_skill",
+    # authoring / execution
+    "write_file", "str_replace_editor", "run_command", "python_eval",
+    "code_helper", "dev_agent", "file_processor", "file_controller",
+    "game_updater",
+    # planning + completion gating (already worker-scoped, listed for clarity)
+    "task_set_plan", "verify_task_result",
+    "enter_plan_mode", "exit_plan_mode", "set_goal", "complete_goal",
 }
 
 def _dbg(tag: str, msg: str):
@@ -474,6 +514,17 @@ TOOL_DECLARATIONS = [
             "properties": {},
         }
     },
+    {
+        "name": "set_titan_microphone",
+        "description": "Mutes or unmutes TITAN's own microphone. Call this when the user says 'mute yourself', 'stop listening', 'unmute yourself', or 'start listening'. This controls TITAN only, not the Windows system volume.",
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "muted": {"type": "BOOLEAN", "description": "True to stop TITAN listening; false to resume listening."}
+            },
+            "required": ["muted"]
+        }
+    },
 
     {
         "name": "get_clock",
@@ -490,9 +541,8 @@ TOOL_DECLARATIONS = [
     *GOAL_TOOLS_DECLARATIONS,
     ASK_USER_DECLARATION,
     *PLAN_MODE_DECLARATIONS,
-    WORKFLOW_DECLARATION,
     *JOB_TOOLS_DECLARATIONS,
-    *SUBAGENT_TOOLS_DECLARATIONS,
+    *TASK_WORKER_DECLARATIONS,
     *FS_TOOLS_DECLARATIONS,
     PYTHON_EVAL_DECLARATION,
     WEB_FETCH_DECLARATION,
@@ -915,11 +965,12 @@ TOOL_DECLARATIONS = [
     {
         "name": "deep_think",
         "description": (
-            "Use ONLY for requests that genuinely need multi-step reasoning or planning — "
-            "e.g. 'plan my exam schedule for the next 2 weeks', 'work out the best strategy for X considering Y and Z', "
-            "'compare these options and reason through the trade-offs', complex math, or multi-constraint decisions. "
-            "Do NOT use for simple facts, small talk, or anything you can already answer directly — "
-            "this tool is slower on purpose because it thinks properly before answering. "
+            "Use ONLY when you need to reason/plan through something yourself before answering out loud — "
+            "e.g. 'plan my exam schedule for the next 2 weeks', 'work out the best strategy considering X and Y', "
+            "complex math, or multi-constraint decisions. This does NOT execute any tools, write files, or run "
+            "commands — it only thinks and hands you back text to speak. If the task actually needs real work "
+            "done (files created, commands run, multi-step execution) use start_task_worker instead, not this. "
+            "Do NOT use for simple facts, small talk, or anything you can already answer directly. "
             "Tell the user briefly that you're thinking it through before calling this."
         ),
         "parameters": {
@@ -928,30 +979,6 @@ TOOL_DECLARATIONS = [
                 "task": {
                     "type": "STRING",
                     "description": "The full question or planning task to reason through, with all relevant context/constraints included."
-                }
-            },
-            "required": ["task"]
-        }
-    },
-    {
-        "name": "run_complex_task",
-        "description": (
-            "Hands a genuinely multi-step, multi-tool piece of WORK off to a slower but more careful "
-            "planning model (NVIDIA), which will call run_command/read_file/write_file/skills/etc itself, "
-            "check its own results, and retry on failure — then hand you back a finished result to speak. "
-            "Use for things like 'build me a PowerPoint on X', 'refactor this script and test it', "
-            "'research Y across a few sources and summarize', or any task where you'd otherwise need to "
-            "chain more than 2-3 tool calls yourself and verify output along the way. "
-            "Do NOT use this for a single tool call, a quick fact, small talk, or anything you can already "
-            "do directly in one or two steps — it's slower on purpose, so only reach for it when the task "
-            "actually has real multi-step complexity. Tell the user briefly you're working on it before calling this."
-        ),
-        "parameters": {
-            "type": "OBJECT",
-            "properties": {
-                "task": {
-                    "type": "STRING",
-                    "description": "The complete task description with all context, constraints, and the exact deliverable expected — the planning model has no memory of this conversation beyond what you put here."
                 }
             },
             "required": ["task"]
@@ -1045,6 +1072,13 @@ class TitanLive:
         self._action_ledger: list[dict] = []
         self._full_brain          = True   # actual value set per-connect in _build_config()
         self._nvidia_history: list[dict] = []   # OpenAI-format running history for full-brain mode
+        self._last_user_request = ""
+        self._last_user_request_at = 0.0
+        self._pending_live_skill = ""
+        # A Gemini Live turn must not keep executing after it hands a complex
+        # job to the durable worker.  It will receive the worker-start result
+        # and can acknowledge it, but the worker owns the actual task.
+        self._live_turn_delegated = False
         self._all_tool_declarations: list[dict] = []   # Gemini-format decls, reused for NVIDIA schema
         self._brain_lock: asyncio.Lock | None = None   # serializes full-brain turns, created on the running loop
         self._mute_brain_filler   = False   # True while suppressing playback of Gemini's own filler reply in full-brain mode
@@ -1102,11 +1136,20 @@ class TitanLive:
 
         async def _send_text():
             try:
+                self._last_user_request = text
+                self._last_user_request_at = time.monotonic()
+                self._live_turn_delegated = False
                 # Reset interrupt and audio-drop flags so model response is accepted
                 self._interrupted = False
                 self._drop_model_audio = False
                 with self._speaking_lock:
                     self._is_speaking = False
+                # In full-brain mode Gemini is only the speech relay. Text
+                # commands must therefore enter the same planner used for
+                # transcribed voice, rather than asking the relay to answer.
+                if self._full_brain:
+                    await self._run_full_brain_turn(text)
+                    return
                 # Close any active mic stream turn so Gemini processes text immediately
                 self._qput_audio({"kind": "end"})
                 if self._turn_done_event:
@@ -1138,6 +1181,7 @@ class TitanLive:
             # Titan just started talking — drop leftover mic so it cannot
             # clog the websocket or barge-in on itself.
             self._speak_started_at = time.monotonic()
+            print("[TITAN] Speaker playback started")
             self._flush_out_queue()
             self.ui.set_state("SPEAKING")
         elif not value:
@@ -1269,7 +1313,7 @@ class TitanLive:
                 print(f"[TITAN] ✋ Interrupted — {drained} speaker chunks discarded")
 
         oq = self.out_queue
-        if oq:
+        if flush_mic and oq:
             mic_drained = 0
             while True:
                 try:
@@ -1280,11 +1324,12 @@ class TitanLive:
             if mic_drained:
                 print(f"[TITAN] 🎤 Flushed {mic_drained} pending mic chunks")
 
-        try:
-            from actions.voice_face_id import _VOICE_GATE_BUFFER
-            _VOICE_GATE_BUFFER.clear()
-        except Exception:
-            pass
+        if flush_mic:
+            try:
+                from actions.voice_face_id import _VOICE_GATE_BUFFER
+                _VOICE_GATE_BUFFER.clear()
+            except Exception:
+                pass
 
         if self._turn_done_event:
             self._turn_done_event.clear()
@@ -1396,12 +1441,24 @@ class TitanLive:
                 if skill_index:
                     parts.append(skill_index)
                 all_tools.append(self.skill_registry.get_tool_declaration())
+                all_tools.append(self.skill_registry.get_search_tool_declaration())
             except Exception:
                 pass
 
-        # Stash for the NVIDIA full-brain loop regardless of mode, so
-        # toggling full_brain_mode doesn't require reconnecting differently.
+        # Stash the FULL set for workers (core/task_workers.py) and the NVIDIA
+        # full-brain loop. Workers must keep strictly more power than the boss.
         self._all_tool_declarations = all_tools
+
+        # The boss only ever sees the fast, speakable subset. See
+        # WORKER_ONLY_TOOLS for why this is a hard filter and not a prompt rule.
+        boss_tools = [
+            d for d in all_tools
+            if (d.get("name") if isinstance(d, dict) else getattr(d, "name", None))
+            not in WORKER_ONLY_TOOLS
+        ]
+        _removed = len(all_tools) - len(boss_tools)
+        print(f"[TITAN] Tool split: boss={len(boss_tools)} tools, "
+              f"worker={len(all_tools)} tools ({_removed} worker-only)")
 
         self._full_brain = _full_brain_enabled()
         if self._full_brain:
@@ -1416,7 +1473,7 @@ class TitanLive:
             self._mute_brain_filler = True
         else:
             live_system_instruction = "\n".join(parts)
-            live_tools_kwarg = [{"function_declarations": all_tools}]
+            live_tools_kwarg = [{"function_declarations": boss_tools}]
 
         cfg_kwargs = dict(
             response_modalities=["AUDIO"],
@@ -1611,12 +1668,22 @@ class TitanLive:
                     tool_executor=self._execute_tool_by_name,
                     gemini_tool_declarations=self._all_tool_declarations,
                     system_prompt=(
-                        f"You are {self._asst_name}, a professional voice assistant with "
-                        "real tool access (files, run_command, skills, web, jobs, etc). "
-                        "Plan silently, call whatever tools the task needs, verify results "
-                        "before claiming success, then answer in a short, natural, spoken "
-                        "style — this text will be read aloud, not displayed, so no markdown "
-                        "or headers."
+                        _load_system_prompt()
+                        + "\n\n"
+                        + (self.skill_registry.index_for_prompt() if getattr(self, "skill_registry", None) else "")
+                        + "\n\nFULL-BRAIN EXECUTION CONTRACT:\n"
+                        + f"You are {self._asst_name}, the deliberate task-planning brain. "
+                        "First classify every request yourself: answer or act directly when it is a simple "
+                        "one-step request; for work that needs multiple actions, real file changes, research, "
+                        "or verification, create a checklist plan first. Select and load the relevant skill "
+                        "before acting whenever one matches. A loaded skill is authoritative: follow its "
+                        "required approach, tools, validation, and quality checks rather than substituting "
+                        "a simpler generic implementation. Then execute each real step and verify the "
+                        "deliverable before claiming success. Do not use a checklist just for show, and do not "
+                        "plan simple requests unnecessarily. Do not merely describe what you could do. "
+                        "For underspecified creative work, ask only for details that materially change "
+                        "the result; otherwise proceed using sensible professional defaults. Your final "
+                        "answer is spoken aloud, so make it short, natural, and honest."
                     ),
                 )
             except Exception as e:
@@ -1695,6 +1762,17 @@ class TitanLive:
         result = await self._execute_tool_by_name(fc.name, dict(fc.args or {}), call_id=fc.id)
         return types.FunctionResponse(id=fc.id, name=fc.name, response={"result": result})
 
+    def _start_worker_for_request(self, task: str, role: str = "executor") -> str:
+        """Start one durable worker only after a final user transcript exists."""
+        if not task or self._looks_like_noise(task):
+            return "No valid user task is available."
+        catalog = self.skill_registry.index_for_prompt() if getattr(self, "skill_registry", None) else ""
+        worker = task_workers.start(
+            task, self._execute_tool_by_name, self._all_tool_declarations, catalog, role=role
+        )
+        self._live_turn_delegated = True
+        return f"Task transferred to persistent worker {worker.id}."
+
     async def _execute_tool_by_name(self, name: str, raw_args: dict, call_id: str = "brain") -> str:
         """Shared tool dispatcher — the ONLY place tool names get routed to
         real implementations. Callable from two places:
@@ -1704,6 +1782,33 @@ class TitanLive:
         Returns the plain result string (not a FunctionResponse) so both
         callers can wrap it however their protocol needs.
         """
+        # Do not let the short-lived voice turn race the durable worker after a
+        # successful handoff.  `brain` calls originate inside that worker and
+        # are deliberately exempt. Also exempt the message/interrupt tools so
+        # the user can still steer or cancel a running worker mid-flight.
+        if (
+            call_id != "brain"
+            and self._live_turn_delegated
+            and name not in {
+                "task_worker_status", "send_task_worker_message", "interrupt_task_worker",
+                "set_titan_microphone", "shutdown_titan",
+            }
+        ):
+            return "This task was delegated to its persistent worker. Do not run more task tools in this live turn. Tell the user it is working."
+
+        # Hard power split. These tools are stripped from the boss's declared
+        # tool list in _build_config(), but a model can still hallucinate a call
+        # to a tool it was never given - so refuse at the dispatcher too, and
+        # name the correct path instead of just erroring.
+        if call_id != "brain" and not running_in_worker() and name in WORKER_ONLY_TOOLS:
+            print(f"[TITAN] ⛔ boss attempted worker-only tool: {name}")
+            return (
+                f"'{name}' is worker-only and is not available in a live voice turn. "
+                "Anything that creates or edits a file, runs a command, or needs skill "
+                "instructions must be handed to a worker: call start_task_worker with the "
+                "user's COMPLETE request, including every detail and constraint they gave."
+            )
+
         # DeepSeek Pre-Execute Pipeline (Path Expansion & Arg Sanitization)
         args = main_agent_loop.pre_step(name, raw_args)
 
@@ -1752,10 +1857,21 @@ class TitanLive:
                 result = goal_manager.complete_goal(outcome)
 
             elif name == "ask_user_question":
-                q = args.get("question", "")
-                header = args.get("header", "")
-                options = args.get("options", [])
-                result = interaction_engine.ask(q, header=header, options=options)
+                    q = args.get("question", "")
+                    header = args.get("header", "")
+                    options = args.get("options", [])
+                    if running_in_worker():
+                        # Worker cannot speak. Hand the question to the boss and
+                        # block THIS worker (not the voice loop) until answered.
+                        result = await task_workers.ask_boss(q, options)
+                    else:
+                        result = interaction_engine.ask(q, header=header, options=options)
+
+            elif name == "answer_worker_question":
+                    result = task_workers.answer_question(
+                        args.get("worker_id", ""), args.get("answer", "")
+                    )
+
 
             elif name == "enter_plan_mode":
                 goal = args.get("goal", "")
@@ -1764,11 +1880,6 @@ class TitanLive:
             elif name == "exit_plan_mode":
                 summary = args.get("summary", "")
                 result = plan_mode.exit_plan_mode(summary)
-
-            elif name == "workflow_start":
-                desc = args.get("task_description", "")
-                max_iter = int(args.get("max_iterations", 3))
-                result = workflow_engine.ralph_loop(desc, max_iterations=max_iter)
 
             elif name == "job_list":
                 result = json.dumps(job_registry.list_jobs(), indent=2)
@@ -1781,23 +1892,6 @@ class TitanLive:
                 jid = args.get("job_id", "")
                 reason = args.get("reason", "Cancelled by user")
                 result = job_registry.kill_job(jid, reason)
-
-            elif name == "invoke_subagent":
-                task = args.get("task", "")
-                role = args.get("role", "specialist")
-                result = subagent_engine.spawn(task, role=role)
-
-            elif name == "list_subagents":
-                result = json.dumps(subagent_engine.list_agents(), indent=2)
-
-            elif name == "send_subagent_message":
-                aid = args.get("subagent_id", "")
-                msg = args.get("message", "")
-                result = subagent_engine.send_message(aid, msg)
-
-            elif name == "interrupt_subagent":
-                aid = args.get("subagent_id", "")
-                result = subagent_engine.interrupt(aid)
 
             elif name == "read_file":
                 p = args.get("path", "")
@@ -1999,35 +2093,38 @@ class TitanLive:
                 else:
                     result = await self._run_deep_think(task)
 
-            elif name == "run_complex_task":
+            elif name == "start_task_worker":
                 task = args.get("task", "").strip()
-                if not task:
-                    result = "No task provided to run_complex_task."
-                else:
-                    # Fresh, isolated history per call — this tool is meant
-                    # for a self-contained piece of work, not an ongoing
-                    # conversation, so it doesn't touch self._nvidia_history
-                    # (that's reserved for full_brain_mode's session-wide loop).
-                    # Exclude itself from the tool list NVIDIA gets, so it
-                    # can't call run_complex_task on itself and recurse forever.
-                    sub_tools = [t for t in self._all_tool_declarations if t.get("name") != "run_complex_task"]
-                    try:
-                        result = await run_brain_turn(
-                            user_text=task,
-                            history=[],
-                            tool_executor=self._execute_tool_by_name,
-                            gemini_tool_declarations=sub_tools,
-                            system_prompt=(
-                                "You are a careful task-execution model with real tool access "
-                                "(files, run_command, skills, web, jobs, etc). Complete the task "
-                                "below fully — call whatever tools are needed, verify results before "
-                                "claiming success, retry on failure. When done, reply with a short, "
-                                "plain-language summary of what you did and the result, suitable to "
-                                "be read aloud — no markdown, no headers."
-                            ),
-                        )
-                    except Exception as e:
-                        result = f"run_complex_task failed to reach the planning model: {e}"
+                role = args.get("role", "executor").strip() or "executor"
+                # Route through the same helper the load_skill auto-delegation
+                # path uses (_start_worker_for_request), instead of duplicating
+                # the raw task_workers.start() call here. That helper also
+                # sets self._live_turn_delegated = True — calling task_workers
+                # .start() directly (the old code) skipped that, so a worker
+                # calling this tool explicitly (rather than via the load_skill
+                # trigger) never armed the "don't also try this yourself"
+                # guard, letting the live turn duplicate/race the worker.
+                result = self._start_worker_for_request(task, role=role)
+
+            elif name == "task_worker_status":
+                result = json.dumps(task_workers.list(), indent=2)
+
+            elif name == "send_task_worker_message":
+                wid = args.get("worker_id", "")
+                msg = args.get("message", "")
+                result = task_workers.send_message(wid, msg)
+
+            elif name == "interrupt_task_worker":
+                wid = args.get("worker_id", "")
+                result = task_workers.interrupt(wid)
+
+            elif name == "task_set_plan":
+                result = await task_workers.set_plan(args.get("steps", []))
+
+            elif name == "verify_task_result":
+                result = await task_workers.verify_current(
+                    args.get("outputs", []), args.get("summary", "")
+                )
 
             elif name == "manage_monitor":
                 action = args.get("action", "").lower().strip()
@@ -2057,8 +2154,30 @@ class TitanLive:
                     await asyncio.sleep(1.5)
                     import os as _os
                     _os._exit(0)
+                asyncio.create_task(_do_shutdown())
+                result = "Shutdown has started."
+
+            elif name == "set_titan_microphone":
+                muted = bool(args.get("muted", True))
+                self.ui.muted = muted
+                result = "TITAN microphone muted." if muted else "TITAN microphone active."
+
+            elif name == "search_skills":
+                query = args.get("query", "").strip()
+                if getattr(self, "skill_registry", None):
+                    result = await loop.run_in_executor(
+                        None, lambda: self.skill_registry.search_for_tool(query)
+                    )
+                else:
+                    result = "Skill registry is not available."
 
             elif name == "load_skill":
+                # No deferred-handoff branch here any more. The old code did NOT
+                # load the skill in a live turn: it stashed the name and bound it
+                # to whatever transcript arrived next, so an interjection ("no",
+                # "wait") became the worker's task and the worker failed with
+                # "I don't understand your instruction". load_skill is now
+                # worker-only (WORKER_ONLY_TOOLS) and always really loads.
                 skill_name = args.get("skill_name", "").strip()
                 if getattr(self, "skill_registry", None):
                     result = await loop.run_in_executor(
@@ -2390,10 +2509,20 @@ class TitanLive:
                                     print(f"[TITAN] 🔇 ignore heard-while-speaking (echo): '{txt[:40]}'")
                                 else:
                                     _dbg("RECV", f"👤 Gemini heard you say: '{txt}'")
-                                    in_buf.append(txt)
-                                    self._last_user_speech = time.monotonic()
+                                    if self._looks_like_noise(txt):
+                                        # Streaming transcription can emit one broken character
+                                        # before the real sentence. Drop it silently.
+                                        pass
+                                    else:
+                                        in_buf.append(txt)
+                                        self._last_user_speech = time.monotonic()
 
                         if sc.turn_complete:
+                            # ESC drops audio for the current turn only. Re-arm it at the
+                            # server turn boundary so a short/quiet next command can speak.
+                            if self._interrupted or self._drop_model_audio:
+                                self._interrupted = False
+                                self._drop_model_audio = False
                             if self._turn_done_event:
                                 self._turn_done_event.set()
 
@@ -2406,7 +2535,10 @@ class TitanLive:
                                 self._mute_brain_filler = True
 
                             full_in = " ".join(in_buf).strip()
-                            if full_in:
+                            if full_in and not self._looks_like_noise(full_in):
+                                self._last_user_request = full_in
+                                self._last_user_request_at = time.monotonic()
+                                self._live_turn_delegated = False
                                 self.ui.write_log(f"You: {full_in}")
                                 self._session_log.append(f"User: {full_in}")
                                 if self._dashboard:
@@ -2422,6 +2554,12 @@ class TitanLive:
                                 # for our own injected [SPEAK_NOW] echoes.
                                 if getattr(self, "_full_brain", False) and not full_in.startswith("[SPEAK_NOW]"):
                                     asyncio.create_task(self._run_full_brain_turn(full_in))
+                                # NOTE: the old `elif self._pending_live_skill:` rescue
+                                # branch lived here. It started a worker using THIS
+                                # transcript for a load_skill call made during a PREVIOUS
+                                # one, so a one-word interjection became the task. The
+                                # boss now hands off explicitly via start_task_worker
+                                # with the full request text instead.
                             in_buf = []
 
                             full_out = " ".join(out_buf).strip()
@@ -2540,6 +2678,11 @@ class TitanLive:
                     break
                 except Exception as e:
                     err = str(e)
+                    # The Python executor is already going away (normally
+                    # because the Qt application is closing).  Retrying only
+                    # produces a stream of identical errors against a dead UI.
+                    if "cannot schedule new futures after shutdown" in err.lower():
+                        break
                     if "stopped" in err.lower() or "-9983" in err:
                         try:
                             stream.start()
@@ -2672,7 +2815,7 @@ class TitanLive:
                 except Exception:
                     news_text = ""
 
-                if not self.session:
+                if not self.session or kind == "progress":
                     return
 
                 if news_text and len(news_text) > 60:
@@ -2738,11 +2881,7 @@ class TitanLive:
     # ── System monitor ──────────────────────────────────────────────────────────
 
     async def _run_system_monitor(self) -> None:
-        """Background task: voice alerts when metrics exceed thresholds.
-
-        Never hijacks the live session while you are talking, while a tool
-        is running, or for RAM alerts (speaking those uses MORE ram).
-        """
+        """Background task: records hardware alerts without interrupting voice."""
         while True:
             await asyncio.sleep(30)
             alert = await asyncio.to_thread(self._sys_monitor.check)
@@ -2752,6 +2891,10 @@ class TitanLive:
                 self.ui.write_log(f"SYS: {str(alert)[:160]}")
             except Exception:
                 pass
+
+            # Hardware warnings stay in the log. Injecting them as a new
+            # model turn can cut across voice playback and user commands.
+            continue
 
             if not self.session:
                 continue
@@ -2815,27 +2958,66 @@ class TitanLive:
         while True:
             await asyncio.sleep(0.45)
             try:
-                events = pop_events()
+                events = await task_workers.pop_events()
             except Exception:
                 events = []
             if not events:
                 continue
             for ev in events:
                 kind = ev.get("kind")
-                did = ev.get("did") or ""
-                path = ev.get("path") or ""
+                worker = ev.get("worker") or {}
+                did = worker.get("task") or ""
+                report = worker.get("result") or worker.get("error") or ""
+                if kind == "progress":
+                    self.ui.write_log(f"SYS: [Worker {worker.get('id', '')}] running {ev.get('tool', '')}")
+                    continue
+                elif kind == "state":
+                    self.ui.write_log(f"SYS: [Worker {worker.get('id', '')}] {ev.get('message', '')}")
+                    continue
+                elif kind == "tool_result":
+                    self.ui.write_log(f"SYS: [Worker {worker.get('id', '')}] {ev.get('tool', '')} finished")
+                    continue
+                elif kind == "question":
+                    # The worker is blocked. Make the boss speak the question,
+                    # then relay the user's reply via answer_worker_question.
+                    wid = worker.get("id", "")
+                    q = ev.get("question", "")
+                    opts = ev.get("options") or []
+                    self.ui.write_log(f"SYS: [Worker {wid}] asks: {q}")
+                    if not self.session:
+                        continue
+                    opt_txt = f" Options: {', '.join(str(o) for o in opts)}." if opts else ""
+                    msg = (
+                        f"[WORKER_QUESTION] Worker {wid} is blocked and needs one decision "
+                        f"from the user. Ask the user this, briefly and in their language: "
+                        f"\"{q}\".{opt_txt} When they reply, immediately call "
+                        f"answer_worker_question with worker_id='{wid}' and their answer. "
+                        "Do not attempt the task yourself."
+                    )
+                    try:
+                        await self.session.send_client_content(
+                            turns={"parts": [{"text": msg}]}, turn_complete=True,
+                        )
+                    except Exception as e:
+                        print(f"[WORKER] inject question: {e}")
+                    continue
+                # completed/failed/interrupted: show the ACTUAL outcome (result
+                # or error), not the original task text. Logging `did` here
+                # (the old code) meant every failure just re-printed what you
+                # asked for, with zero information about why it failed.
                 try:
-                    self.ui.write_log(f"SYS: [Worker] {kind} — {did[:140]}")
+                    label = report if report else did[:140]
+                    self.ui.write_log(f"SYS: [Worker] {kind} — {label[:200]}")
                 except Exception:
                     pass
 
                 if not self.session:
                     continue
 
-                if kind == "done":
+                if kind == "completed":
                     msg = (
-                        f"[WORKER_EVENT] Job finished: {did}. Output path: {path}. "
-                        "Inform the user naturally in one brief sentence."
+                        f"[WORKER_EVENT] Task finished: {did}. Worker report: {report}. "
+                        "Inform the user truthfully in one brief sentence; do not add claims beyond the report."
                     )
                     try:
                         await self.session.send_client_content(
@@ -2845,7 +3027,7 @@ class TitanLive:
                     except Exception as e:
                         print(f"[WORKER] inject done: {e}")
                 elif kind == "failed":
-                    msg = f"[WORKER_EVENT] Job failed: {did}. Inform the user truthfully in one brief sentence."
+                    msg = f"[WORKER_EVENT] Task failed: {did}. Worker error: {report}. Inform the user truthfully in one brief sentence."
                     try:
                         await self.session.send_client_content(
                             turns={"parts": [{"text": msg}]},
@@ -2853,6 +3035,15 @@ class TitanLive:
                         )
                     except Exception as e:
                         print(f"[WORKER] inject failed: {e}")
+                elif kind == "interrupted":
+                    msg = f"[WORKER_EVENT] Task stopped: {did}. Tell the user it was interrupted and did not finish."
+                    try:
+                        await self.session.send_client_content(
+                            turns={"parts": [{"text": msg}]},
+                            turn_complete=True,
+                        )
+                    except Exception as e:
+                        print(f"[WORKER] inject interrupted: {e}")
 
     async def _run_proactive_mode(self) -> None:
         """

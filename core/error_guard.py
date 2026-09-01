@@ -16,6 +16,16 @@ from typing import Any, Dict, List, Optional, Tuple
 
 
 class ErrorGuard:
+    # A successful call to one of these means the world changed, so an identical
+    # command afterwards is a legitimate retry, not a loop. Without this, the
+    # guard blocked the normal fix cycle: `node build.js` fails -> edit the file
+    # -> `node build.js` is byte-identical, so the guard refused to run it and
+    # the worker could never see whether its fix worked.
+    STATE_CHANGING_TOOLS = {
+        "write_file", "str_replace_editor", "file_controller", "code_helper",
+        "dev_agent", "python_eval",
+    }
+
     def __init__(self, repeat_threshold: int = 3):
         self.repeat_threshold = repeat_threshold
         # Tracks tool call signatures and their outcomes
@@ -44,13 +54,20 @@ class ErrorGuard:
         }
         self._history.append(entry)
 
+        # A successful state-changing call invalidates the failure history:
+        # whatever failed before was against the OLD file contents.
+        if not is_error and tool_name in self.STATE_CHANGING_TOOLS:
+            for e in self._history[:-1]:
+                e["is_error"] = False
+            return False, None
+
         # Check for repeated failures with the same signature
         recent_matches = [e for e in self._history[-6:] if e["sig"] == sig and e["is_error"]]
         if len(recent_matches) >= self.repeat_threshold:
             warning = (
-                f"[LOOP HYGIENE WARNING] Tool '{tool_name}' has failed {len(recent_matches)} times with identical arguments. "
-                "STOP repeating the exact same call. You MUST analyze the error below, change your approach, "
-                "modify the script/parameters, or ask sir for guidance."
+                f"[LOOP HYGIENE WARNING] Tool '{tool_name}' has failed {len(recent_matches)} times with identical arguments "
+                "and nothing was changed in between. STOP repeating the exact same call. Analyze the error below and "
+                "change your approach - edit the script, fix the parameters, or read the file to see its real contents."
             )
             return True, warning
 

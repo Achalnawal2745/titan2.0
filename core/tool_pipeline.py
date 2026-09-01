@@ -27,6 +27,24 @@ from core.spill import maybe_spill_output
 # past the cut. The model literally never saw them.
 NEVER_SPILL_TOOLS = {"load_skill"}
 
+# Per-tool spill budgets (max_lines, max_chars). The global default of
+# 50 lines / 2500 chars is right for a chatty `run_command`, but it crippled
+# the worker on its own source files: a 155-line generator script came back as
+# 12 head + 12 tail lines (~15% of it), so every str_replace_editor call was
+# built from memory instead of from what it could see, failed to match, and
+# burned hops re-reading narrow windows. A worker that cannot read the file it
+# just wrote cannot edit that file.
+#
+# read_file already supports offset_lines/max_lines, so genuinely huge files can
+# still be paged deliberately - these budgets only stop ordinary source files
+# from being shredded when the model asked for the whole thing.
+SPILL_BUDGETS = {
+    "read_file": (2000, 120_000),
+    "grep_search": (200, 20_000),
+    "glob_search": (200, 20_000),
+    "file_controller": (200, 20_000),
+}
+
 
 class ToolPipeline:
     def __init__(self, guard: Optional[ErrorGuard] = None):
@@ -78,6 +96,11 @@ class ToolPipeline:
         # every time to actually do the task right (see comment above).
         if tool_name in NEVER_SPILL_TOOLS:
             spilled_text, was_spilled, spill_path = str(raw_result or ""), False, None
+        elif tool_name in SPILL_BUDGETS:
+            _lines, _chars = SPILL_BUDGETS[tool_name]
+            spilled_text, was_spilled, spill_path = maybe_spill_output(
+                tool_name, raw_result, max_lines=_lines, max_chars=_chars
+            )
         else:
             spilled_text, was_spilled, spill_path = maybe_spill_output(tool_name, raw_result)
 
