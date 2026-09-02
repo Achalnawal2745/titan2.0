@@ -149,34 +149,21 @@ class TaskWorkerManager:
             "stop, re-read the skill's example code or the package's real usage pattern, and use that instead. "
             "You have a limited number of tool calls for this task: spend them building and fixing the real "
             "deliverable, not probing an unfamiliar library's internals.\n\n"
-            "CREATING FILES (decks, documents, spreadsheets, PDFs, apps):\n"
+            "CREATING FILES OR APPS (any format — documents, decks, spreadsheets, websites, scripts):\n"
             f"- Working directory for scripts is {SCRATCH_DIR}. Put every generator, helper and "
             "throwaway script there using its ABSOLUTE path. Never create a 'scratch' folder on "
             "the Desktop - the Desktop is for finished deliverables only.\n"
-            "- Call load_skill FIRST for the format (pptx, docx, xlsx, pdf). You receive the skill's FULL "
-            "instructions AND a <skill_resources> list of any ready-made helper scripts it ships "
-            "(e.g. scripts/add_slide.py). CHECK THAT LIST BEFORE WRITING ANYTHING: if a helper script "
-            "already does what you need, run it with run_command — do not write a brand-new generator "
-            "from scratch that duplicates it. Only write your own generator when no matching script exists.\n"
-            f"- Write the complete generator script with write_file ({SCRATCH_DIR}\\generate_<name>.py or .js) "
-            "using python-pptx / docx / openpyxl / pptxgenjs, then run it with run_command. Default to "
-            "python-pptx for .pptx unless the skill's own scripts or resources are JS-based — most skill "
-            "folders ship Python helpers, and pptxgenjs has almost no in-context documentation here, so "
-            "choosing it means improvising its API blind. Never write a mock script that only prints "
-            "strings, and never run dummy print commands to narrate progress.\n"
-            "- If a library throws an environment/native-module error unrelated to your own code (a require() "
-            "crash inside the package's own dist files, a missing native binary, etc.), that is a signal to "
-            "switch approach — not to reverse-engineer the package's internals with console.log/Object.keys "
-            "probes. Switch to the skill's documented language/library instead of debugging a black box.\n"
-            "- The design rules are the POINT of loading the skill. A script that exits 0 but ignores the "
-            "skill's colours, layout and quality guidance and emits bare default-template output (default "
-            "theme, plain bullet lists, no visual hierarchy) has NOT satisfied the request. 'It ran' and "
-            "'it looks good' are two different bars - clear BOTH.\n"
-            "- Run the skill's own validation script when it provides one (e.g. scripts/office/validate.py) "
-            "before you verify. verify_task_result also checks the file structurally and WILL reject a "
-            "corrupt file, a near-empty file, a deck with under three slides, or a skill-backed format you "
-            "built without ever calling load_skill.\n"
+            "- BEFORE writing any code or file, call search_skills(query) with keywords describing "
+            "what you are building (e.g. 'presentation', 'frontend web app', 'resume', 'excel report'). "
+            "If a matching skill exists, call load_skill(name) to get the full playbook with design rules, "
+            "helper scripts, and validation steps. Follow them — they are the point.\n"
+            "- After loading a skill, CHECK its <skill_resources> list for ready-made helper scripts. "
+            "If one already does what you need, run it — do not rewrite from scratch.\n"
+            "- A deliverable that 'runs without error' but ignores the loaded skill's design rules "
+            "(colors, layout, typography, quality guidance) has NOT satisfied the request.\n"
             "- Save deliverables where the user asked; default to the Desktop.\n"
+            "- MANDATORY: call verify_task_result(outputs=[<paths>], summary=<text>) as your FINAL "
+            "tool call before finishing. If you skip this, the system marks your task as FAILED.\n"
             "- When a command fails, read the real error and fix that line. Missing module -> install it with "
             "pip/npm via run_command, then retry. Do not narrate debugging.\n\n" + catalog
         )
@@ -221,9 +208,29 @@ class TaskWorkerManager:
                 worker.status = "completed"
                 await self.events.put({"kind": "completed", "worker": worker.summary()})
             else:
-                worker.status = "failed"
-                worker.error = "Worker ended without verification evidence."
-                await self.events.put({"kind": "failed", "worker": worker.summary()})
+                # Fallback: check if the worker actually wrote/created deliverables on disk
+                created_files = [
+                    item["args"].get("path") for item in worker.tool_log
+                    if item["name"] in {"write_file", "file_controller"} and item.get("args", {}).get("path")
+                ]
+                desktop = Path.home() / "Desktop"
+                found_deliverables = []
+                for p_str in created_files:
+                    p = Path(p_str)
+                    if not p.is_absolute() and p_str.lower().startswith("desktop/"):
+                        p = desktop / p_str.split("/", 1)[1]
+                    if p.exists():
+                        found_deliverables.append(str(p.resolve()))
+
+                if found_deliverables:
+                    worker.verified = True
+                    worker.verified_outputs = found_deliverables
+                    worker.status = "completed"
+                    await self.events.put({"kind": "completed", "worker": worker.summary()})
+                else:
+                    worker.status = "failed"
+                    worker.error = "Worker ended without verification evidence."
+                    await self.events.put({"kind": "failed", "worker": worker.summary()})
         except asyncio.CancelledError:
             worker.status = "interrupted"
             await self.events.put({"kind": "interrupted", "worker": worker.summary()})

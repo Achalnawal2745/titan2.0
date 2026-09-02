@@ -76,30 +76,34 @@ class SkillRegistry:
         if not self._skills:
             return ""
 
-        primary_skills = [
-            "pptx", "docx", "xlsx", "pdf", "canvas-design", "theme-factory",
-            "tailored-resume-generator", "artifacts-builder", "mcp-builder",
-            "webapp-testing", "changelog-generator", "meeting-insights-analyzer",
-            "content-research-writer", "deep-research", "algorithmic-art",
-            "playwright-pro", "brand-guidelines", "code-tour", "git-worktree-manager"
-        ]
+        # Build a representative sample — never hardcode skill names.
+        # Show up to 30 skills so the model sees the breadth of what exists,
+        # then tell it to search_skills() for anything not shown.
+        all_names = sorted(self._skills.keys())
+        sample_size = min(30, len(all_names))
+        # Spread evenly across the alphabetical list so it's not just A-C
+        step = max(1, len(all_names) // sample_size) if sample_size else 1
+        sampled = all_names[::step][:sample_size]
 
         lines = [
             "<system-reminder>",
-            "A skill is a reusable set of task-specific instructions. The following skills are available in this session:",
+            f"You have access to {len(self._skills)} skills. Skills are reusable playbooks with "
+            "design rules, helper scripts, and quality checks. BEFORE starting any creative or "
+            "building task, call search_skills(query) to find the right playbook, then load_skill(name) "
+            "to get the full instructions. Never skip this — skills contain design standards, color "
+            "systems, validation scripts, and ready-made helpers that save you from guessing.",
             "",
-            "<available_skills>",
+            f"<available_skills count=\"{len(self._skills)}\" showing=\"{len(sampled)} sample\">",
         ]
-        for name in primary_skills:
-            if name in self._skills:
-                rec = self._skills[name]
-                desc = rec.description.replace("\n", " ").strip()
-                lines.append(f"- `{rec.name}`: {desc}")
+        for name in sampled:
+            rec = self._skills[name]
+            desc = rec.description.replace("\n", " ").strip()[:100]
+            lines.append(f"- `{rec.name}`: {desc}")
         lines.extend([
             "</available_skills>",
             "",
-            f"There are {len(self._skills)} total skills available. For other tasks, call search_skills(query) first.",
-            "If the task clearly matches a skill, call the `load_skill` tool with the exact skill name before taking task actions. Follow the loaded <skill_instructions>.",
+            "This is only a sample. Always call search_skills(query) to find the best skill for "
+            "your specific task — there are likely skills you haven't seen above that match better.",
             "</system-reminder>",
         ])
         return "\n".join(lines)
