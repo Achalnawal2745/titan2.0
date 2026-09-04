@@ -5,6 +5,8 @@ import platform
 from pathlib import Path
 from datetime import datetime
 
+from core.undo import push_undo
+
 try:
     import send2trash
     _SEND2TRASH = True
@@ -262,8 +264,23 @@ def create_file(path: str, name: str = "", content: str = "") -> str:
         target = (base / name) if name else base
         if not _is_safe_path(target):
             return f"Access denied: {target}"
+        existed = target.exists()
+        prev_content = None
+        if existed:
+            try:
+                prev_content = target.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                prev_content = None  # binary or unreadable — can't restore text, but proceed
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8")
+
+        if existed and prev_content is not None:
+            push_undo(f"created {target.name} (overwrote existing file)",
+                       lambda t=target, c=prev_content: (t.write_text(c, encoding="utf-8"), f"Restored previous contents of {t.name}.")[1])
+        elif not existed:
+            push_undo(f"created {target.name}",
+                       lambda t=target: (t.unlink(missing_ok=True), f"Deleted {t.name}.")[1])
+
         return f"File created: {target.name}"
     except Exception as e:
         return f"Could not create file: {e}"
@@ -275,7 +292,16 @@ def create_folder(path: str, name: str = "") -> str:
         target = (base / name) if name else base
         if not _is_safe_path(target):
             return f"Access denied: {target}"
+        existed = target.exists()
         target.mkdir(parents=True, exist_ok=True)
+        if not existed:
+            def _undo_mkdir(t=target):
+                try:
+                    t.rmdir()   # only removes if still empty — never eats files someone put in it
+                    return f"Removed {t.name}."
+                except OSError:
+                    return f"{t.name} now has files in it — left it in place."
+            push_undo(f"created folder {target.name}", _undo_mkdir)
         return f"Folder created: {target.name}"
     except Exception as e:
         return f"Could not create folder: {e}"
@@ -325,7 +351,10 @@ def move_file(path: str, name: str = "", destination: str = "") -> str:
             dst = dst / src.name
 
         dst.parent.mkdir(parents=True, exist_ok=True)
+        original_src = src
         shutil.move(str(src), str(dst))
+        push_undo(f"moved {original_src.name} → {dst.parent.name}/",
+                   lambda s=original_src, d=dst: (shutil.move(str(d), str(s)), f"Moved {d.name} back to {s.parent.name}/.")[1])
         return f"Moved: {src.name} → {dst.parent.name}/"
 
     except Exception as e:
@@ -357,6 +386,17 @@ def copy_file(path: str, name: str = "", destination: str = "") -> str:
         else:
             shutil.copy2(str(src), str(dst))
 
+        def _undo_copy(d=dst, is_dir=src.is_dir()):
+            try:
+                if is_dir:
+                    shutil.rmtree(str(d))
+                else:
+                    d.unlink(missing_ok=True)
+                return f"Removed the copy at {d.parent.name}/{d.name}."
+            except Exception as e:
+                return f"Could not remove copy: {e}"
+        push_undo(f"copied {src.name} → {dst.parent.name}/", _undo_copy)
+
         return f"Copied: {src.name} → {dst.parent.name}/"
 
     except Exception as e:
@@ -379,6 +419,8 @@ def rename_file(path: str, name: str = "", new_name: str = "") -> str:
             return f"A file named '{new_name}' already exists here."
 
         target.rename(new_path)
+        push_undo(f"renamed {target.name} → {new_name}",
+                   lambda old_p=target, new_p=new_path: (new_p.rename(old_p), f"Renamed back to {old_p.name}.")[1])
         return f"Renamed: {target.name} → {new_name}"
 
     except Exception as e:
@@ -465,11 +507,27 @@ def write_file(path: str, name: str = "", content: str = "",
             return f"Access denied: {target}"
         target.parent.mkdir(parents=True, exist_ok=True)
 
+        existed = target.exists()
+        prev_content = None
+        if existed:
+            try:
+                prev_content = target.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                prev_content = None  # binary/unreadable — undo will still work by truncating on append
+
         # ── Word (.docx) safe writer fix ───────────────────────────────────────
         mode = "a" if append else "w"
         with open(target, mode, encoding="utf-8") as f:
             f.write(content)
         action = "Appended to" if append else "Written to"
+
+        if not existed:
+            push_undo(f"wrote {target.name}",
+                       lambda t=target: (t.unlink(missing_ok=True), f"Deleted {t.name}.")[1])
+        elif prev_content is not None:
+            push_undo(f"{'appended to' if append else 'overwrote'} {target.name}",
+                       lambda t=target, c=prev_content: (t.write_text(c, encoding="utf-8"), f"Restored previous contents of {t.name}.")[1])
+
         return f"{action}: {target.name}"
     except Exception as e:
         return f"Could not write file: {e}"
@@ -577,6 +635,7 @@ def organize_desktop() -> str:
 
     desktop = _get_desktop()
     moved, skipped = [], []
+    move_log: list[tuple[Path, Path]] = []   # (new_path, original_path) — for undo
 
     try:
         for item in desktop.iterdir():
@@ -600,8 +659,23 @@ def organize_desktop() -> str:
                 skipped.append(item.name)
                 continue
 
+            original_path = item
             shutil.move(str(item), str(new_path))
+            move_log.append((new_path, original_path))
             moved.append(f"{item.name} → {target_dir.name}/")
+
+        if move_log:
+            def _undo_organize(log=list(move_log)):
+                restored = 0
+                for new_p, orig_p in log:
+                    try:
+                        if new_p.exists():
+                            shutil.move(str(new_p), str(orig_p))
+                            restored += 1
+                    except Exception:
+                        continue
+                return f"Moved {restored}/{len(log)} file(s) back to the Desktop."
+            push_undo(f"organized desktop ({len(move_log)} files)", _undo_organize)
 
         result = f"Desktop organized: {len(moved)} files moved."
         if moved:

@@ -93,10 +93,17 @@ Formal citations and standard references.
                 p = Path.home() / "Desktop" / p.name
             p.parent.mkdir(parents=True, exist_ok=True)
             if p.suffix.lower() == ".docx":
-                from actions.doc_editor.docx_editor import DocxBuilder
-                b = DocxBuilder()
-                b.add_markdown(report_md)
-                b.save(p)
+                import docx
+                doc = docx.Document()
+                for line in report_md.splitlines():
+                    ls = line.rstrip()
+                    if not ls: continue
+                    if ls.startswith("# "): doc.add_heading(ls[2:], level=1)
+                    elif ls.startswith("## "): doc.add_heading(ls[3:], level=2)
+                    elif ls.startswith("### "): doc.add_heading(ls[4:], level=3)
+                    elif ls.startswith("- ") or ls.startswith("* "): doc.add_paragraph(ls[2:], style='List Bullet')
+                    else: doc.add_paragraph(ls)
+                doc.save(str(p))
             else:
                 p.write_text(report_md, encoding="utf-8")
             return f"✅ Research briefing complete and saved to {p.name}:\n\n{report_md[:1500]}..."

@@ -99,10 +99,17 @@ Rules:
         p.parent.mkdir(parents=True, exist_ok=True)
 
         if p.suffix.lower() == ".docx":
-            from actions.doc_editor.docx_editor import DocxBuilder
-            b = DocxBuilder()
-            b.add_markdown(resume_md, default_font="Calibri", body_pt=11)
-            b.save(p)
+            import docx
+            doc = docx.Document()
+            for line in resume_md.splitlines():
+                ls = line.rstrip()
+                if not ls: continue
+                if ls.startswith("# "): doc.add_heading(ls[2:], level=1)
+                elif ls.startswith("## "): doc.add_heading(ls[3:], level=2)
+                elif ls.startswith("### "): doc.add_heading(ls[4:], level=3)
+                elif ls.startswith("- ") or ls.startswith("* "): doc.add_paragraph(ls[2:], style='List Bullet')
+                else: doc.add_paragraph(ls)
+            doc.save(str(p))
         else:
             p.write_text(resume_md, encoding="utf-8")
 

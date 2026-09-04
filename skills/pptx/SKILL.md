@@ -14,11 +14,6 @@ A `.pptx` is a ZIP archive of XML files. Choose your approach by task:
 | **Edit** an existing deck, or build from a template | unzip → edit `ppt/slides/slideN.xml` → zip |
 | **Read** content | `markitdown deck.pptx` (one block per slide under `<!-- Slide number: N -->` markers); visual grid: `python scripts/thumbnail.py deck.pptx` |
 
-## Additional References (read on demand, not every time)
-
-- `ooxml.md` (same folder) — full raw OOXML schema reference. Read this when a specific edit isn't covered by the scripts above and you need to hand-write or hand-patch slide XML directly.
-- `html2pptx.md` (same folder) — HTML/CSS-to-PowerPoint conversion via `html2pptx.js`. Read this when a layout is easier to design in HTML/CSS than to construct through pptxgenjs's API (e.g. complex multi-element positioning), not as the default path for ordinary decks.
-
 ## Scripts
 
 Paths are relative to this skill's directory. Everything else is plain Python, `node`, or shell.

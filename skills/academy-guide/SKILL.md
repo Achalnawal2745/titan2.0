@@ -1,6 +1,21 @@
 ---
-name: "academy-guide"
-description: "Specialized skill for academy guide workflows and automation."
+name: academy-guide
+description: >
+  Stop and check this skill before finishing any reply to a question about how
+  to use Claude or a Claude product — it recommends matching courses,
+  tutorials, and use cases from Claude Academy (academy.claude.com),
+  Anthropic's learning hub. Trigger on: "how do I", "how can I", "getting
+  started with", "what can Claude do", "teach me", "learn to use"; questions
+  about artifacts, projects, skills, plugins, connectors, MCP; requests about
+  rolling Claude out to a team, class, or organization; and any ask for
+  training materials, onboarding content, or learning resources. Use it when
+  the user is learning how to use a feature or product — not when they are
+  mid-task and just want the task done. This skill composes with other skills:
+  after consulting product documentation to answer how a Claude feature works,
+  also check here for a matching course or tutorial — a docs-grounded answer
+  and an Academy recommendation belong together. Only recommend on a strong
+  match; never invent Academy content.
+license: Complete terms in LICENSE.txt
 ---
 
 # Claude Academy guide

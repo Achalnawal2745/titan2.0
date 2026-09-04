@@ -1,11 +1,15 @@
 #computer_settings.py
 import json
+import os
 import re
 import sys
 import time
 import subprocess
 import platform
 from pathlib import Path
+
+import core.confirm as confirm
+from core.undo import push_undo
 
 try:
     import pyautogui
@@ -95,16 +99,43 @@ def volume_set(value: int):
             from ctypes import cast, POINTER
             from comtypes import CLSCTX_ALL
             from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
-            devices   = AudioUtilities.GetSpeakers()
-            interface = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
-            vol       = cast(interface, POINTER(IAudioEndpointVolume))
-            vol_db    = -65.25 if value == 0 else max(-65.25, 20 * math.log10(value / 100))
-            vol.SetMasterVolumeLevel(vol_db, None)
-            return
+            devices = AudioUtilities.GetSpeakers()
+            vol = None
+            if hasattr(devices, "EndpointVolume") and devices.EndpointVolume is not None:
+                vol = devices.EndpointVolume
+            elif hasattr(devices, "Activate"):
+                interface = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+                vol = cast(interface, POINTER(IAudioEndpointVolume))
+            elif hasattr(devices, "Endpoint") and hasattr(devices.Endpoint, "Activate"):
+                interface = devices.Endpoint.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+                vol = cast(interface, POINTER(IAudioEndpointVolume))
+
+            if vol is not None:
+                if hasattr(vol, "SetMasterVolumeLevelScalar"):
+                    vol.SetMasterVolumeLevelScalar(value / 100.0, None)
+                else:
+                    vol_db = -65.25 if value == 0 else max(-65.25, 20 * math.log10(value / 100))
+                    vol.SetMasterVolumeLevel(vol_db, None)
+                return
         except Exception as e:
-            print(f"[Settings] pycaw failed, using keypress fallback: {e}")
-            pyautogui.press("volumemute")
-            pyautogui.press("volumemute")
+            print(f"[Settings] pycaw volume set failed ({e}), using keypress fallback")
+
+        try:
+            if _PYAUTOGUI:
+                if value == 100:
+                    for _ in range(50):
+                        pyautogui.press("volumeup")
+                elif value == 0:
+                    for _ in range(50):
+                        pyautogui.press("volumedown")
+                else:
+                    for _ in range(50):
+                        pyautogui.press("volumedown")
+                    for _ in range(int(value // 2)):
+                        pyautogui.press("volumeup")
+                return
+        except Exception as e:
+            print(f"[Settings] Fallback volume set failed: {e}")
     elif _OS == "Darwin":
         subprocess.run(["osascript", "-e", f"set volume output volume {value}"],
             capture_output=True)
@@ -634,7 +665,32 @@ ACTION_MAP: dict[str, callable] = {
     "shutdown":            shutdown_computer,
 }
 
-_DANGEROUS_ACTIONS = {"restart", "shutdown"}
+_UNDO_BY_OPPOSITE: dict[str, callable] = {
+    "volume_up":     volume_down,
+    "volume_down":   volume_up,
+    "mute":          volume_mute,   # a real mute toggles; calling it again toggles back
+    "unmute":        volume_mute,
+    "toggle_mute":   volume_mute,
+    "brightness_up":   brightness_down,
+    "brightness_down": brightness_up,
+    "dark_mode":       dark_mode,   # toggle — calling again flips it back
+    "toggle_wifi":     toggle_wifi, # toggle — calling again flips it back
+}
+
+# Actions where the gate matters: either destructive (recycle bin bypasses the
+# undo stack entirely) or a self-lockout risk (toggling off the network TITAN
+# is being talked to over). See core/confirm.py for why this can't just be a
+# "confirmed=yes" tool parameter anymore.
+_DANGEROUS_ACTIONS = {
+    "restart", "shutdown",
+    "empty_recycle_bin", "clear_recycle_bin", "empty_trash",
+    "toggle_wifi",
+}
+
+# Actions that are cleanly reversible by calling the "opposite" action again —
+# no need to query or store a previous value. Wired onto the shared undo stack
+# (core/undo.py) so "undo" after "volume up" just calls volume_down(), etc.
+_UNDO_BY_OPPOSITE: dict[str, callable] = {}  # filled in below, once the funcs exist
 
 
 
@@ -702,12 +758,25 @@ def computer_settings(
         player.write_log(f"[Settings] {action}")
 
     if action in _DANGEROUS_ACTIONS:
-        confirmed = str(params.get("confirmed", "")).lower()
-        if confirmed not in ("yes", "true", "1", "confirm"):
-            return (
-                f"This will {action} the computer. "
-                f"Please confirm by calling again with confirmed=yes."
-            )
+        func = ACTION_MAP.get(action)
+        title_map = {
+            "restart":           "Restart the computer?",
+            "shutdown":          "Shut down the computer?",
+            "empty_recycle_bin": "Empty the Recycle Bin?",
+            "toggle_wifi":       "Toggle WiFi?",
+        }
+        detail_map = {
+            "restart":           "Any unsaved work in other apps will be lost.",
+            "shutdown":          "The computer will power off. Any unsaved work will be lost.",
+            "empty_recycle_bin": "Everything currently in the Recycle Bin is deleted permanently — this cannot be undone.",
+            "toggle_wifi":       "If TITAN is reachable only over this WiFi connection, this may cut it off until the adapter is re-enabled by hand.",
+        }
+        return confirm.request(
+            key=f"computer_settings:{action}",
+            title=title_map.get(action, f"{action.replace('_', ' ').capitalize()}?"),
+            detail=detail_map.get(action, "This cannot be undone."),
+            run=lambda a=action, f=func: (f() or f"Done: {a}.") if f else f"Unknown action: '{a}'.",
+        )
 
     if action == "volume_set":
         try:
@@ -762,6 +831,9 @@ def computer_settings(
 
     try:
         func()
+        inverse = _UNDO_BY_OPPOSITE.get(action)
+        if inverse:
+            push_undo(action.replace("_", " "), lambda inv=inverse, a=action: (inv() or f"Reversed: {a}."))
         return f"Done: {action}."
     except Exception as e:
         print(f"[Settings] Action failed ({action}): {e}")

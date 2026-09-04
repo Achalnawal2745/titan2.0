@@ -91,6 +91,40 @@ def save_brief_enabled(enabled: bool) -> None:
     CONFIG_FILE.write_text(json.dumps(data, indent=4), encoding="utf-8")
 
 
+def get_input_device() -> str:
+    """Saved microphone device name, or '' for system default."""
+    return load_api_keys().get("input_device", "") or ""
+
+
+def get_output_device() -> str:
+    """Saved speaker device name, or '' for system default."""
+    return load_api_keys().get("output_device", "") or ""
+
+
+def save_input_device(device_name: str) -> None:
+    ensure_config_dir()
+    data: dict = {}
+    if CONFIG_FILE.exists():
+        try:
+            data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            data = {}
+    data["input_device"] = (device_name or "").strip()
+    CONFIG_FILE.write_text(json.dumps(data, indent=4), encoding="utf-8")
+
+
+def save_output_device(device_name: str) -> None:
+    ensure_config_dir()
+    data: dict = {}
+    if CONFIG_FILE.exists():
+        try:
+            data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            data = {}
+    data["output_device"] = (device_name or "").strip()
+    CONFIG_FILE.write_text(json.dumps(data, indent=4), encoding="utf-8")
+
+
 def get_plugin_enabled(plugin_name: str) -> bool:
     """Plugins are enabled by default the moment they're discovered (opt-out model)."""
     return load_api_keys().get("plugins_enabled", {}).get(plugin_name, True)

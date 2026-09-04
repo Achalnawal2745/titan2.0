@@ -34,7 +34,7 @@ from PyQt6.QtGui import (
 from PyQt6.QtWidgets import (
     QApplication, QDialog, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit,
     QMainWindow, QPushButton, QScrollArea, QSizePolicy, QSplitter,
-    QStackedWidget, QTextEdit, QVBoxLayout, QWidget, QProgressBar,
+    QStackedWidget, QTextEdit, QVBoxLayout, QWidget, QProgressBar, QComboBox,
 )
 
 def _base_dir() -> Path:
@@ -1288,11 +1288,13 @@ class HueWheel(QWidget):
 class CustomizeOverlay(QWidget):
     """Floating overlay — change assistant name, user name and UI colour."""
 
-    saved = pyqtSignal(str, str, str)   # assistant_name, user_name, ui_color
-    _OW, _OH = 400, 500
+    saved = pyqtSignal(str, str, str, str, str)   # assistant_name, user_name, ui_color, input_device, output_device
+    _devices_ready = pyqtSignal(list, list)        # (input_names, output_names) — off the query thread
+    _OW, _OH = 400, 620
 
     def __init__(self, assistant_name="TITAN", user_name="",
-                 ui_color=DEFAULT_UI_COLOR, parent=None):
+                 ui_color=DEFAULT_UI_COLOR, input_device="", output_device="",
+                 parent=None):
         super().__init__(parent)
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setStyleSheet(f"""
@@ -1380,6 +1382,61 @@ class CustomizeOverlay(QWidget):
         self._hex_input.textEdited.connect(self._on_hex_edited)
         lay.addWidget(self._hex_input)
 
+        # ── Audio devices — which mic/speakers TITAN uses ───────────────────
+        lay.addSpacing(4)
+        dev_hdr = QHBoxLayout()
+        dev_hdr.addWidget(_lbl("AUDIO DEVICES", 8, color=C.TEXT_DIM,
+                               align=Qt.AlignmentFlag.AlignLeft))
+        dev_hdr.addStretch()
+        refresh_btn = QPushButton("⟳ REFRESH")
+        refresh_btn.setFixedSize(72, 20)
+        refresh_btn.setFont(QFont("Segoe UI", 7, QFont.Weight.Bold))
+        refresh_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        refresh_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: transparent; color: {C.TEXT_MED};
+                border: 1px solid {C.BORDER}; border-radius: 3px;
+            }}
+            QPushButton:hover {{ color: {C.TEXT}; border-color: {C.BORDER_B}; }}
+        """)
+        refresh_btn.clicked.connect(lambda: self._populate_devices(refresh=True))
+        dev_hdr.addWidget(refresh_btn)
+        lay.addLayout(dev_hdr)
+
+        _combo_style = f"""
+            QComboBox {{
+                background: #000d12; color: {C.TEXT};
+                border: 1px solid {C.BORDER}; border-radius: 3px; padding: 4px 8px;
+            }}
+            QComboBox:focus {{ border: 1px solid {C.PRI}; }}
+            QComboBox QAbstractItemView {{
+                background: #000d12; color: {C.TEXT};
+                selection-background-color: {C.PRI_GHO};
+            }}
+        """
+        self._initial_input_device  = (input_device or "").strip()
+        self._initial_output_device = (output_device or "").strip()
+
+        lay.addWidget(_lbl("Microphone", 8, color=C.TEXT_DIM, align=Qt.AlignmentFlag.AlignLeft))
+        self._input_combo = QComboBox()
+        self._input_combo.setFont(QFont("Segoe UI", 9))
+        self._input_combo.setFixedHeight(28)
+        self._input_combo.setStyleSheet(_combo_style)
+        lay.addWidget(self._input_combo)
+
+        lay.addWidget(_lbl("Speakers", 8, color=C.TEXT_DIM, align=Qt.AlignmentFlag.AlignLeft))
+        self._output_combo = QComboBox()
+        self._output_combo.setFont(QFont("Segoe UI", 9))
+        self._output_combo.setFixedHeight(28)
+        self._output_combo.setStyleSheet(_combo_style)
+        lay.addWidget(self._output_combo)
+
+        self._devices_note = _lbl("Loading devices...", 7, color=C.TEXT_DIM,
+                                   align=Qt.AlignmentFlag.AlignLeft)
+        lay.addWidget(self._devices_note)
+        self._devices_ready.connect(self._on_devices_ready)
+        self._populate_devices(refresh=False)
+
         lay.addSpacing(6)
         btn_row = QHBoxLayout(); btn_row.setSpacing(8)
 
@@ -1450,11 +1507,141 @@ class CustomizeOverlay(QWidget):
             self.on_preview(self._initial_color)
         self.hide()
 
+    def _populate_devices(self, refresh: bool) -> None:
+        """Queries core.audio_devices off the UI thread — sd.query_devices()
+        can take a few hundred ms and must never freeze this panel."""
+        self._devices_note.setText("Refreshing devices..." if refresh else "Loading devices...")
+
+        def _work():
+            try:
+                from core import audio_devices
+                ins  = audio_devices.list_devices("input", refresh=refresh)
+                outs = audio_devices.list_devices("output", refresh=refresh)
+            except Exception:
+                ins, outs = [], []
+            self._devices_ready.emit(ins, outs)
+
+        threading.Thread(target=_work, daemon=True, name="ui-audio-devices").start()
+
+    def _on_devices_ready(self, inputs: list, outputs: list) -> None:
+        from core.audio_devices import DEFAULT_LABEL
+
+        self._input_combo.clear()
+        self._input_combo.addItem(DEFAULT_LABEL)
+        self._input_combo.addItems(inputs)
+        want_in = self._initial_input_device
+        idx = self._input_combo.findText(want_in) if want_in else 0
+        self._input_combo.setCurrentIndex(idx if idx >= 0 else 0)
+
+        self._output_combo.clear()
+        self._output_combo.addItem(DEFAULT_LABEL)
+        self._output_combo.addItems(outputs)
+        want_out = self._initial_output_device
+        idx = self._output_combo.findText(want_out) if want_out else 0
+        self._output_combo.setCurrentIndex(idx if idx >= 0 else 0)
+
+        self._devices_note.setText(
+            f"{len(inputs)} microphone(s), {len(outputs)} speaker(s) found. "
+            "Changes apply on TITAN's next reconnect."
+        )
+
     def _save(self):
         name = self._name_input.text().strip() or "TITAN"
         user = self._user_input.text().strip()
-        self.saved.emit(name, user, self._sel_color or DEFAULT_UI_COLOR)
+        from core.audio_devices import DEFAULT_LABEL
+        in_dev  = self._input_combo.currentText()
+        out_dev = self._output_combo.currentText()
+        in_dev  = "" if in_dev == DEFAULT_LABEL else in_dev
+        out_dev = "" if out_dev == DEFAULT_LABEL else out_dev
+        self.saved.emit(name, user, self._sel_color or DEFAULT_UI_COLOR, in_dev, out_dev)
         self.hide()
+
+
+class ConfirmBanner(QWidget):
+    """The on-screen half of core/confirm.py.
+
+    Deliberately NOT a modal dialog: TITAN keeps talking and listening while
+    this is up. It just sits on top of the HUD until the user presses one of
+    the two buttons — both of which call core.confirm.resolve(), never
+    anything in this file. This widget has no idea what it's confirming; it
+    only shows the title/detail it's given and reports which button was hit.
+    """
+    _OW, _OH = 460, 150
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setStyleSheet(f"""
+            ConfirmBanner {{
+                background: rgba(10, 4, 4, 250);
+                border: 1px solid {C.RED};
+                border-radius: 8px;
+            }}
+        """)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(18, 14, 18, 14)
+        lay.setSpacing(6)
+
+        hdr = QHBoxLayout()
+        icon = QLabel("⚠")
+        icon.setFont(QFont("Segoe UI", 12, QFont.Weight.Bold))
+        icon.setStyleSheet(f"color: {C.RED}; background: transparent;")
+        hdr.addWidget(icon)
+        self._title_lbl = QLabel("Confirm action")
+        self._title_lbl.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
+        self._title_lbl.setStyleSheet(f"color: {C.TEXT}; background: transparent;")
+        self._title_lbl.setWordWrap(True)
+        hdr.addWidget(self._title_lbl, stretch=1)
+        lay.addLayout(hdr)
+
+        self._detail_lbl = QLabel("")
+        self._detail_lbl.setFont(QFont("Segoe UI", 8))
+        self._detail_lbl.setStyleSheet(f"color: {C.TEXT_MED}; background: transparent;")
+        self._detail_lbl.setWordWrap(True)
+        lay.addWidget(self._detail_lbl, stretch=1)
+
+        btn_row = QHBoxLayout(); btn_row.setSpacing(8)
+
+        confirm_btn = QPushButton("✓  CONFIRM")
+        confirm_btn.setFixedHeight(32)
+        confirm_btn.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
+        confirm_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        confirm_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: transparent; color: {C.RED};
+                border: 1px solid {C.RED}; border-radius: 3px;
+            }}
+            QPushButton:hover {{ background: rgba(255, 60, 60, 0.15); }}
+        """)
+        confirm_btn.clicked.connect(lambda: self._respond(True))
+        btn_row.addWidget(confirm_btn)
+
+        cancel_btn = QPushButton("✕  CANCEL")
+        cancel_btn.setFixedHeight(32)
+        cancel_btn.setFont(QFont("Segoe UI", 9))
+        cancel_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        cancel_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: transparent; color: {C.TEXT_MED};
+                border: 1px solid {C.BORDER}; border-radius: 3px;
+            }}
+            QPushButton:hover {{ color: {C.TEXT}; border-color: {C.BORDER_B}; }}
+        """)
+        cancel_btn.clicked.connect(lambda: self._respond(False))
+        btn_row.addWidget(cancel_btn)
+        lay.addLayout(btn_row)
+
+    def set_content(self, title: str, detail: str) -> None:
+        self._title_lbl.setText(title or "Confirm action")
+        self._detail_lbl.setText(detail or "")
+
+    def _respond(self, accepted: bool) -> None:
+        # This widget only reports the click. core.confirm.resolve() owns the
+        # actual decision of whether the pending action still exists / hasn't
+        # timed out, runs the callback, and tells us (via the hide callback
+        # bound in main.py) when to disappear.
+        from core.confirm import resolve as _confirm_resolve
+        _confirm_resolve(accepted)
 
 
 class ClipboardPanel(QWidget):
@@ -2410,6 +2597,8 @@ class MainWindow(QMainWindow):
     _enroll_face_sig = pyqtSignal()          # open visual face enrollment window (thread-safe)
     _lock_screen_sig = pyqtSignal()          # open lock screen dialog on main thread (thread-safe)
     _esc_sig         = pyqtSignal()          # global ESC / interrupt signal
+    _confirm_sig      = pyqtSignal(str, str)  # (title, detail) — show the confirm banner
+    _confirm_hide_sig = pyqtSignal()          # hide the confirm banner
 
     def __init__(self, face_path: str):
         super().__init__()
@@ -2443,6 +2632,7 @@ class MainWindow(QMainWindow):
         self._remote_overlay: RemoteKeyOverlay | None = None
         self._customize_overlay: CustomizeOverlay | None = None
         self._terminal_overlay: TerminalOverlay | None = None
+        self._confirm_banner: ConfirmBanner | None = None
 
         central = QWidget()
         central.setStyleSheet(f"background: {C.BG};")
@@ -2574,6 +2764,8 @@ class MainWindow(QMainWindow):
         self._sec_refresh_sig.connect(self._refresh_security_buttons)
         self._enroll_face_sig.connect(self._enroll_face)
         self._lock_screen_sig.connect(self._open_lock_screen_dialog)
+        self._confirm_sig.connect(self._show_confirm_banner)
+        self._confirm_hide_sig.connect(self._hide_confirm_banner)
         self._lock_auth_event = threading.Event()
         self._lock_authenticated = False
         self._cam_stop = threading.Event()
@@ -2981,6 +3173,8 @@ class MainWindow(QMainWindow):
             )
         if self._terminal_overlay and self._terminal_overlay.isVisible():
             self._position_terminal_overlay()
+        if self._confirm_banner and self._confirm_banner.isVisible():
+            self._position_confirm_banner()
         if getattr(self, "_editor_overlay", None) and self._editor_overlay.isVisible():
             self._position_editor_overlay()
         # Camera preview — bottom-right corner of the center/HUD area
@@ -3019,6 +3213,30 @@ class MainWindow(QMainWindow):
                 (cw.width() - ow) // 2,
                 (cw.height() - oh) // 2,
                 ow, oh
+            )
+
+    def _show_confirm_banner(self, title: str, detail: str):
+        """Main-thread slot for core.confirm.request() — never called directly,
+        only via the _confirm_sig signal so it's safe from any thread."""
+        if not self._confirm_banner:
+            self._confirm_banner = ConfirmBanner(self.centralWidget())
+        self._confirm_banner.set_content(title, detail)
+        self._position_confirm_banner()
+        self._confirm_banner.show()
+        self._confirm_banner.raise_()
+
+    def _hide_confirm_banner(self):
+        if self._confirm_banner:
+            self._confirm_banner.hide()
+
+    def _position_confirm_banner(self):
+        if self._confirm_banner:
+            cw = self.centralWidget()
+            ow, oh = ConfirmBanner._OW, ConfirmBanner._OH
+            self._confirm_banner.setGeometry(
+                (cw.width() - ow) // 2,
+                16,
+                ow, oh,
             )
 
     def _toggle_editor(self):
@@ -4131,6 +4349,8 @@ class MainWindow(QMainWindow):
             cfg.get("assistant_name", "TITAN") or "TITAN",
             cfg.get("user_name", ""),
             cfg.get("ui_color", "") or DEFAULT_UI_COLOR,
+            cfg.get("input_device", "") or "",
+            cfg.get("output_device", "") or "",
             parent=cw,
         )
         ow, oh = CustomizeOverlay._OW, CustomizeOverlay._OH
@@ -4151,7 +4371,8 @@ class MainWindow(QMainWindow):
         if apply_ui_accent(hex_color):
             retheme_all_widgets(old, current_palette())
 
-    def _apply_name_update(self, name: str, user_name: str, ui_color: str = ""):
+    def _apply_name_update(self, name: str, user_name: str, ui_color: str = "",
+                            input_device: str = "", output_device: str = ""):
         """Update all name/theme-dependent UI elements and persist to config."""
         self._assistant_name = name.strip() or "TITAN"
         display = self._assistant_name.upper()
@@ -4179,10 +4400,17 @@ class MainWindow(QMainWindow):
             data["user_name"] = user_name.strip()
             if ui_color:
                 data["ui_color"] = ui_color.strip().lower()
+            data["input_device"]  = (input_device or "").strip()
+            data["output_device"] = (output_device or "").strip()
             API_FILE.write_text(json.dumps(data, indent=4), encoding="utf-8")
             self._log.append_log(f"SYS: Identity updated — {display}")
             if color_changed:
                 self._log.append_log(f"SYS: UI colour applied — {ui_color}")
+            if input_device or output_device:
+                self._log.append_log(
+                    f"SYS: Audio device(s) saved — mic: {input_device or 'default'}, "
+                    f"speakers: {output_device or 'default'} (applies on next reconnect)"
+                )
         except Exception as e:
             self._log.append_log(f"ERR: Config save failed — {e}")
 
@@ -4439,6 +4667,20 @@ class TitanUI:
     def show_content(self, title: str, text: str):
         """Thread-safe: display content in the panel below the HUD."""
         self._win._content_sig.emit(title[:48], text[:4000])
+
+    def show_confirm_banner(self, title: str, detail: str) -> None:
+        """Thread-safe: called by core.confirm.request() to put the CONFIRM /
+        CANCEL banner on screen. Never blocks — the banner just sits there
+        until the user clicks something, which calls core.confirm.resolve()."""
+        if self._alive:
+            self._win._confirm_sig.emit(title, detail)
+
+    def hide_confirm_banner(self) -> None:
+        """Thread-safe: called by core.confirm.resolve() once a pending
+        confirmation has been accepted, cancelled, or timed out."""
+        if self._alive:
+            self._win._confirm_hide_sig.emit()
+
 
     def prompt_reconfig(self):
         """Thread-safe: show the API key setup overlay (e.g. after an auth error)."""

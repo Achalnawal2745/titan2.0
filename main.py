@@ -7,7 +7,7 @@ import platform as _platform
 import subprocess as _subprocess
 import warnings
 os.environ["QT_LOGGING_RULES"] = "*.debug=false;qt.qpa.*=false;qt.text.*=false;qt.qpa.window=false"
-warnings.filterwarnings("ignore", category=DeprecationWarning)
+warnings.filterwarnings("ignore")
 
 try:
     import colorama
@@ -128,7 +128,11 @@ from actions.voice_face_id import (
     handle_security_command, get_security_config as get_sec_config,
 )
 from actions.web_search        import _news as _fetch_news_sync
-from memory.config_manager     import get_brief_enabled
+from memory.config_manager     import (
+    get_brief_enabled,
+    get_input_device, get_output_device,
+    save_input_device, save_output_device,
+)
 from memory.work_pad           import (
     run_work_pad,
     format_for_prompt as format_pad_for_prompt,
@@ -157,6 +161,9 @@ from core.code_runner import run_python_code, PYTHON_EVAL_DECLARATION
 from core.web_tools import web_fetch, WEB_FETCH_DECLARATION
 from core.nvidia_brain import run_brain_turn
 from core.task_workers import task_workers, TASK_WORKER_DECLARATIONS, running_in_worker
+import core.confirm as confirm
+import core.audio_devices as audio_devices
+from core.undo import undo_last, peek as undo_peek, push_undo, clear as undo_clear
 # core.workflow_engine (WORKFLOW_DECLARATION/ralph_loop) and core.subagent_engine
 # (SUBAGENT_TOOLS_DECLARATIONS) are intentionally NOT imported anymore. Both were
 # earlier, half-built "do complex work" paths that ended up coexisting with
@@ -523,6 +530,41 @@ TOOL_DECLARATIONS = [
                 "muted": {"type": "BOOLEAN", "description": "True to stop TITAN listening; false to resume listening."}
             },
             "required": ["muted"]
+        }
+    },
+    {
+        "name": "undo_last_action",
+        "description": (
+            "Reverses the most recent reversible action TITAN performed (a setting change, "
+            "a mic mute, etc). Call this the instant the user says 'undo', 'undo that', 'put "
+            "it back', or 'go back'. Runs immediately — never ask for confirmation first."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "peek_only": {
+                    "type": "BOOLEAN",
+                    "description": "True to just report what WOULD be undone, without doing it (e.g. user asks 'what can you undo').",
+                }
+            },
+        }
+    },
+    {
+        "name": "set_titan_audio_device",
+        "description": (
+            "Lists or switches which microphone or speakers TITAN uses. Call with action='list' "
+            "when the user asks what microphones/speakers are available, or action='set' with "
+            "kind and device_name to switch TITAN to a specific device. The change applies the "
+            "next time TITAN reconnects (usually within a few seconds)."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "action": {"type": "STRING", "description": "'list' or 'set'"},
+                "kind": {"type": "STRING", "description": "'input' (microphone) or 'output' (speakers)"},
+                "device_name": {"type": "STRING", "description": "Exact device name from the list — required for action='set'."},
+            },
+            "required": ["action"]
         }
     },
 
@@ -2140,7 +2182,8 @@ class TitanLive:
                     result = "Specify action (add/remove/list) and a topic."
 
             elif name == "shutdown_titan":
-                self.ui.write_log("SYS: Shutdown requested.")
+                # Genuinely irreversible — gate behind a real button press instead
+                # of trusting the model's own "confirmed=yes". See core/confirm.py.
                 async def _do_shutdown():
                     await self._save_session_summary()
                     if self.session:
@@ -2152,15 +2195,62 @@ class TitanLive:
                         except Exception:
                             pass
                     await asyncio.sleep(1.5)
+                    undo_clear()
                     import os as _os
                     _os._exit(0)
-                asyncio.create_task(_do_shutdown())
-                result = "Shutdown has started."
+
+                def _run_shutdown():
+                    if self._loop:
+                        asyncio.run_coroutine_threadsafe(_do_shutdown(), self._loop)
+                    return "Shutdown started."
+
+                assistant_name = self.ui.assistant_name or "TITAN"
+                result = confirm.request(
+                    key="shutdown_titan",
+                    title=f"Shut down {assistant_name}?",
+                    detail="This ends the current session completely.",
+                    run=_run_shutdown,
+                )
 
             elif name == "set_titan_microphone":
                 muted = bool(args.get("muted", True))
+                was_muted = self.ui.muted
                 self.ui.muted = muted
+                if was_muted != muted:
+                    def _undo_mute(prev=was_muted):
+                        self.ui.muted = prev
+                        return "TITAN microphone unmuted." if not prev else "TITAN microphone muted."
+                    push_undo(f"TITAN microphone {'muted' if muted else 'unmuted'}", _undo_mute)
                 result = "TITAN microphone muted." if muted else "TITAN microphone active."
+
+            elif name == "undo_last_action":
+                if bool(args.get("peek_only", False)):
+                    label = undo_peek()
+                    result = f"The last reversible action was: {label}." if label else "There is nothing to undo right now."
+                else:
+                    result = await loop.run_in_executor(None, undo_last)
+
+            elif name == "set_titan_audio_device":
+                action = str(args.get("action", "list")).lower()
+                kind = str(args.get("kind", "input")).lower()
+                if kind not in ("input", "output"):
+                    kind = "input"
+                if action == "set":
+                    dev_name = str(args.get("device_name", "")).strip()
+                    if kind == "input":
+                        save_input_device(dev_name)
+                    else:
+                        save_output_device(dev_name)
+                    result = (
+                        f"{'Microphone' if kind == 'input' else 'Speaker'} set to "
+                        f"'{dev_name or 'system default'}'. This takes effect on TITAN's next reconnect."
+                    )
+                else:
+                    devices = await loop.run_in_executor(None, lambda: audio_devices.list_devices(kind))
+                    result = (
+                        f"Available {'microphones' if kind == 'input' else 'speakers'}: "
+                        + (", ".join(devices) if devices else "none found — using system default")
+                    )
 
             elif name == "search_skills":
                 query = args.get("query", "").strip()
@@ -2438,11 +2528,13 @@ class TitanLive:
                         _reset_vad()
 
         try:
+            in_device = audio_devices.resolve(get_input_device(), "input")
             with sd.InputStream(
                 samplerate=SEND_SAMPLE_RATE,
                 channels=CHANNELS,
                 dtype="int16",
                 blocksize=CHUNK_SIZE,
+                device=in_device,
                 callback=callback,
             ):
                 print("[TITAN] 🎤 Mic stream open")
@@ -2615,11 +2707,13 @@ class TitanLive:
     async def _play_audio(self):
         print("[TITAN] 🔊 Play started")
 
+        out_device = audio_devices.resolve(get_output_device(), "output")
         stream = sd.RawOutputStream(
             samplerate=RECEIVE_SAMPLE_RATE,
             channels=CHANNELS,
             dtype="int16",
             blocksize=CHUNK_SIZE,
+            device=out_device,
         )
         stream.start()
         self._play_stream = stream
@@ -3312,6 +3406,16 @@ class TitanLive:
 
 def main():
     ui = TitanUI("face.png")
+
+    # Wire the confirmation gate to the HUD (thread-safe show/hide/log callbacks).
+    # Nothing here blocks — see core/confirm.py.
+    confirm.bind(ui.show_confirm_banner, ui.hide_confirm_banner, ui.write_log)
+
+    # Tell audio_devices which sample rates the streams actually use, then warm
+    # its device-list cache on a background thread so the first "what mics do
+    # I have" question doesn't stall on sd.query_devices().
+    audio_devices.configure(SEND_SAMPLE_RATE, RECEIVE_SAMPLE_RATE)
+    audio_devices.prefetch()
 
     def runner():
         ui.wait_for_api_key()

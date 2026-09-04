@@ -1,7 +1,10 @@
 #web_search.py
 import json
 import sys
+import warnings
 from pathlib import Path
+
+warnings.filterwarnings("ignore")
 
 def _get_base_dir() -> Path:
     if getattr(sys, "frozen", False):

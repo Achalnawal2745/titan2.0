@@ -16,6 +16,7 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from core.spill import maybe_spill_output
+from core.undo import push_undo
 
 
 def _resolve_user_path(path: str) -> Path:
@@ -62,10 +63,26 @@ def write_file(path: str, content: str, overwrite: bool = True) -> str:
     p = _resolve_user_path(path)
     if p.exists() and not overwrite:
         return f"Error: File '{path}' already exists and overwrite is False."
-    
+
     try:
+        existed = p.exists()
+        prev_content = None
+        if existed:
+            try:
+                prev_content = p.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                prev_content = None  # binary/unreadable — skip undo rather than guess
+
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content, encoding="utf-8")
+
+        if not existed:
+            push_undo(f"wrote {p.name}",
+                       lambda t=p: (t.unlink(missing_ok=True), f"Deleted {t.name}.")[1])
+        elif prev_content is not None:
+            push_undo(f"overwrote {p.name}",
+                       lambda t=p, c=prev_content: (t.write_text(c, encoding="utf-8"), f"Restored previous contents of {t.name}.")[1])
+
         return f"Successfully wrote {len(content.encode('utf-8'))} bytes to '{p}'."
     except Exception as e:
         return f"Error writing to file '{path}': {e}"
@@ -79,7 +96,7 @@ def str_replace_editor(path: str, old_str: str, new_str: str) -> str:
     p = _resolve_user_path(path)
     if not p.exists():
         return f"Error: File '{path}' does not exist."
-    
+
     try:
         content = p.read_text(encoding="utf-8", errors="replace")
         count = content.count(old_str)
@@ -87,9 +104,14 @@ def str_replace_editor(path: str, old_str: str, new_str: str) -> str:
             return f"Error: target string not found in '{p.name}'. Please check the exact whitespace/lines."
         if count > 1:
             return f"Error: target string matched {count} times in '{p.name}'. Must be completely unique. Include more surrounding lines."
-        
+
         new_content = content.replace(old_str, new_str, 1)
         p.write_text(new_content, encoding="utf-8")
+        # Restore the whole prior file rather than re-running the replace in
+        # reverse — new_str isn't guaranteed unique the way old_str was checked
+        # to be, so a literal "undo the substitution" could match the wrong spot.
+        push_undo(f"edited {p.name}",
+                   lambda t=p, c=content: (t.write_text(c, encoding="utf-8"), f"Reverted {t.name} to before the edit.")[1])
         return f"Successfully replaced block in '{p.name}'."
     except Exception as e:
         return f"Error editing '{path}': {e}"
