@@ -39,47 +39,6 @@ if _platform.system() == "Windows":
 
 import asyncio
 import re
-import os
-os.environ["OPENBLAS_NUM_THREADS"] = "1"
-os.environ["MKL_NUM_THREADS"] = "1"
-os.environ["NUMEXPR_NUM_THREADS"] = "1"
-os.environ["OMP_NUM_THREADS"] = "1"
-import platform as _platform
-import subprocess as _subprocess
-import warnings
-os.environ["QT_LOGGING_RULES"] = "*.debug=false;qt.qpa.*=false;qt.text.*=false;qt.qpa.window=false"
-warnings.filterwarnings("ignore", category=DeprecationWarning)
-
-try:
-    import colorama
-    colorama.just_fix_windows_console()
-except Exception:
-    try:
-        import ctypes
-        kernel32 = ctypes.windll.kernel32
-        hStdOut = kernel32.GetStdHandle(-11)
-        mode = ctypes.c_ulong()
-        kernel32.GetConsoleMode(hStdOut, ctypes.byref(mode))
-        kernel32.SetConsoleMode(hStdOut, mode.value | 0x0004)
-    except Exception:
-        pass
-
-# ── Nuclear: force CREATE_NO_WINDOW on EVERY subprocess call on Windows ───────
-# This patches Popen itself, so no per-file flag is needed anywhere.
-if _platform.system() == "Windows":
-    _OrigPopen = _subprocess.Popen
-
-    class _Popen(_OrigPopen):
-        def __init__(self, args, **kw):
-            kw["creationflags"] = kw.get("creationflags", 0) | _subprocess.CREATE_NO_WINDOW
-            kw.pop("startupinfo", None)   # drop any stale/shared STARTUPINFO
-            super().__init__(args, **kw)
-
-    _subprocess.Popen = _Popen
-# ─────────────────────────────────────────────────────────────────────────────
-
-import asyncio
-import re
 import threading
 import queue
 import time
@@ -91,6 +50,11 @@ from datetime import datetime
 from pathlib import Path
 
 import sounddevice as sd
+# sounddevice versions that still assign to ndarray.shape trigger a NumPy 2.5
+# deprecation warning from inside the stream callback. It is a dependency warning,
+# not an application failure; keep TITAN's console clean until sounddevice is updated.
+warnings.filterwarnings("ignore", message=r"Setting the shape on a NumPy array has been deprecated in NumPy 2\.5\.", category=DeprecationWarning, module=r"sounddevice")
+warnings.filterwarnings("ignore", category=DeprecationWarning, module=r"sounddevice")
 from google import genai
 from google.genai import types
 from ui import TitanUI
@@ -2704,18 +2668,95 @@ class TitanLive:
             traceback.print_exc()
             raise
 
+    def _open_output_stream(self):
+        """Open a real working PortAudio output stream.
+
+        The audio-device helper can return a device that PortAudio reports as
+        valid even though that host/device combination moves 0 ms of audio.
+        On Windows this is commonly a DirectSound/WASAPI/MME routing problem.
+        Try the configured device first, then the system default, then every
+        usable output device.  The first stream that actually opens is kept.
+        """
+        candidates = []
+
+        def add_candidate(dev):
+            if dev is None or dev == "":
+                return
+            if dev not in candidates:
+                candidates.append(dev)
+
+        # Saved/configured device.
+        try:
+            add_candidate(audio_devices.resolve(get_output_device(), "output"))
+        except Exception as e:
+            print(f"[Audio] configured output resolve failed: {e}")
+
+        # PortAudio's current default output.
+        try:
+            default_out = sd.default.device[1]
+            add_candidate(default_out)
+        except Exception:
+            pass
+
+        # Finally enumerate all output devices.  Put MME first on Windows
+        # because the user's log showed DirectSound opening but moving 0 ms.
+        try:
+            devices = list(sd.query_devices())
+            rows = []
+            for idx, dev in enumerate(devices):
+                if int(dev.get("max_output_channels", 0)) <= 0:
+                    continue
+                host = ""
+                try:
+                    host = sd.query_hostapis(int(dev.get("hostapi", -1))).get("name", "")
+                except Exception:
+                    pass
+                rows.append((idx, str(dev.get("name", "")), host))
+            rows.sort(key=lambda x: (0 if "MME" in x[2].upper() else 1, x[0]))
+            for idx, _, _ in rows:
+                add_candidate(idx)
+        except Exception as e:
+            print(f"[Audio] output enumeration failed: {e}")
+
+        last_error = None
+        for dev in candidates:
+            try:
+                info = sd.query_devices(dev, "output")
+                name = str(info.get("name", dev))
+                host = ""
+                try:
+                    host = sd.query_hostapis(int(info.get("hostapi", -1))).get("name", "")
+                except Exception:
+                    pass
+                print(f"[Audio] trying output: {name} [{host}] (device {dev})")
+
+                # Use a slightly larger block than the mic.  It reduces
+                # underruns on Windows while keeping voice latency low.
+                stream = sd.RawOutputStream(
+                    samplerate=RECEIVE_SAMPLE_RATE,
+                    channels=CHANNELS,
+                    dtype="int16",
+                    blocksize=CHUNK_SIZE,
+                    device=dev,
+                    latency="low",
+                )
+                stream.start()
+                print(f"[Audio] output ready: {name} [{host}] (device {dev})")
+                return stream
+            except Exception as e:
+                last_error = e
+                print(f"[Audio] output failed on {dev}: {e}")
+                try:
+                    stream.stop()
+                    stream.close()
+                except Exception:
+                    pass
+
+        raise RuntimeError(f"No working audio output device found. Last error: {last_error}")
+
     async def _play_audio(self):
         print("[TITAN] 🔊 Play started")
-
-        out_device = audio_devices.resolve(get_output_device(), "output")
-        stream = sd.RawOutputStream(
-            samplerate=RECEIVE_SAMPLE_RATE,
-            channels=CHANNELS,
-            dtype="int16",
-            blocksize=CHUNK_SIZE,
-            device=out_device,
-        )
-        stream.start()
+        stream = self._open_output_stream()
         self._play_stream = stream
 
         try:
@@ -2909,7 +2950,7 @@ class TitanLive:
                 except Exception:
                     news_text = ""
 
-                if not self.session or kind == "progress":
+                if not self.session:
                     return
 
                 if news_text and len(news_text) > 60:
