@@ -2823,10 +2823,10 @@ class TitanLive:
                             stream.start()
                         except Exception:
                             pass
-                        self.set_speaking(False)
+                        await asyncio.sleep(0.04)
                         continue
                     print(f"[TITAN] ⚠️ play write: {err[:120]}")
-                    self.set_speaking(False)
+                    await asyncio.sleep(0.04)
                     continue
         except Exception as e:
             print(f"[TITAN] ❌ Play: {e}")

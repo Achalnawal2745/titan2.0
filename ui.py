@@ -17,6 +17,12 @@ from pathlib import Path
 
 import psutil
 
+try:
+    from ultron_orb_gl import UltronOrbGL
+    _HAS_ULTRON_ORB = True
+except ImportError:
+    _HAS_ULTRON_ORB = False
+
 if platform.system() == "Windows":
     _WIN_HIDE: dict = {"creationflags": subprocess.CREATE_NO_WINDOW}
 else:
@@ -347,6 +353,7 @@ class _SysMetrics:
 _metrics = _SysMetrics()
 
 class HudCanvas(QWidget):
+    """Native PyQt6 3D Holographic Ultron Orb HUD Component"""
     def __init__(self, face_path: str, assistant_name: str = "TITAN", parent=None):
         super().__init__(parent)
         self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent)
@@ -361,100 +368,72 @@ class HudCanvas(QWidget):
         self._tick       = 0
         self._scale      = 1.0
         self._tgt_scale  = 1.0
-        self._halo       = 55.0
-        self._tgt_halo   = 55.0
         self._last_t     = time.time()
-        self._scan       = 0.0
-        self._scan2      = 180.0
-        self._rings      = [0.0, 120.0, 240.0]
-        self._pulses: list[float] = [0.0, 50.0, 100.0]
-        self._blink      = True
-        self._blink_tick = 0
+        self._rot_x      = 0.2
+        self._rot_y      = 0.0
+        self._drag_start = None
+
         self._particles: list[list[float]] = []
-        self._face_px: QPixmap | None = None
         self._mouse_pos = QPointF(-100, -100)
         self.setMouseTracking(True)
-        self._load_face(face_path)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
 
         self._tmr = QTimer(self)
         self._tmr.timeout.connect(self._step)
         self._tmr.start(16)
 
+    def mousePressEvent(self, ev):
+        if ev.button() == Qt.MouseButton.LeftButton:
+            self._drag_start = ev.position()
+
+    def mouseReleaseEvent(self, ev):
+        if ev.button() == Qt.MouseButton.LeftButton:
+            if self._drag_start and (ev.position() - self._drag_start).manhattanLength() < 5:
+                if hasattr(self, 'on_clicked') and callable(self.on_clicked):
+                    self.on_clicked()
+            self._drag_start = None
+
     def mouseMoveEvent(self, ev):
         self._mouse_pos = ev.position()
+        if self._drag_start and ev.buttons() & Qt.MouseButton.LeftButton:
+            delta = ev.position() - self._drag_start
+            self._rot_y += delta.x() * 0.008
+            self._rot_x += delta.y() * 0.008
+            self._drag_start = ev.position()
         self.update()
-
-    def _load_face(self, path: str):
-        try:
-            from PIL import Image, ImageDraw
-            import io
-            img = Image.open(path).convert("RGBA")
-            sz  = min(img.size)
-            img = img.resize((sz, sz), Image.LANCZOS)
-            mk  = Image.new("L", (sz, sz), 0)
-            ImageDraw.Draw(mk).ellipse((2, 2, sz - 2, sz - 2), fill=255)
-            img.putalpha(mk)
-            buf = io.BytesIO()
-            img.save(buf, format="PNG")
-            px = QPixmap(); px.loadFromData(buf.getvalue())
-            self._face_px = px
-        except Exception:
-            self._face_px = None
 
     def _step(self):
         self._tick += 1
-        now = time.time()
-        if now - self._last_t > (0.12 if self.speaking else 0.5):
-            if self.speaking:
-                self._tgt_scale = random.uniform(1.06, 1.14)
-                self._tgt_halo  = random.uniform(145, 190)
-            elif self.muted:
-                self._tgt_scale = random.uniform(0.998, 1.002)
-                self._tgt_halo  = random.uniform(15, 28)
-            else:
-                self._tgt_scale = random.uniform(1.001, 1.008)
-                self._tgt_halo  = random.uniform(48, 68)
-            self._last_t = now
+        speed = 0.025 if self.speaking else (0.018 if self.state == "THINKING" else 0.006)
+        self._rot_y += speed
+        self._rot_x += speed * 0.35
 
-        sp = 0.38 if self.speaking else 0.15
-        self._scale += (self._tgt_scale - self._scale) * sp
-        self._halo  += (self._tgt_halo  - self._halo)  * sp
+        if self.speaking:
+            self._tgt_scale = random.uniform(1.08, 1.18)
+        elif self.muted:
+            self._tgt_scale = 0.98
+        else:
+            self._tgt_scale = 1.0 + 0.02 * math.sin(self._tick * 0.08)
 
-        speeds = [1.3, -0.9, 2.0] if self.speaking else [0.55, -0.35, 0.9]
-        for i, spd in enumerate(speeds):
-            self._rings[i] = (self._rings[i] + spd) % 360
-
-        self._scan  = (self._scan  + (3.0 if self.speaking else 1.3)) % 360
-        self._scan2 = (self._scan2 + (-2.0 if self.speaking else -0.75)) % 360
-
-        fw  = min(self.width(), self.height())
-        lim = fw * 0.74
-        spd = 4.2 if self.speaking else 2.0
-        self._pulses = [r + spd for r in self._pulses if r + spd < lim]
-        if len(self._pulses) < 3 and random.random() < (0.07 if self.speaking else 0.025):
-            self._pulses.append(0.0)
-
-        # Maintain a living particle swarm for the constellation effect
-        cx, cy = self.width() / 2, self.height() / 2
-        if len(self._particles) < 28:
-            ang = random.uniform(0, 2 * math.pi)
-            r_s = random.uniform(fw * 0.1, fw * 0.38)
-            self._particles.append([
-                cx + math.cos(ang) * r_s, cy + math.sin(ang) * r_s,
-                random.uniform(-1.2, 1.2), random.uniform(-1.2, 1.2), 1.0,
-            ])
-
-        for p_pt in self._particles:
-            p_pt[0] += p_pt[2]
-            p_pt[1] += p_pt[3]
-            # Wrap around canvas bounds
-            if p_pt[0] < 0 or p_pt[0] > self.width(): p_pt[2] *= -1
-            if p_pt[1] < 0 or p_pt[1] > self.height(): p_pt[3] *= -1
-
-        if self._blink_tick >= 38:
-            self._blink = not self._blink
-            self._blink_tick = 0
+        self._scale += (self._tgt_scale - self._scale) * 0.2
         self.update()
+
+    def _project_3d(self, x, y, z, cx, cy, radius):
+        rad_x = self._rot_x
+        cos_x, sin_x = math.cos(rad_x), math.sin(rad_x)
+        y1 = y * cos_x - z * sin_x
+        z1 = y * sin_x + z * cos_x
+
+        rad_y = self._rot_y
+        cos_y, sin_y = math.cos(rad_y), math.sin(rad_y)
+        x2 = x * cos_y + z1 * sin_y
+        z2 = -x * sin_y + z1 * cos_y
+
+        fov = 4.5
+        scale = radius * fov / (fov + z2)
+        px = cx + x2 * scale
+        py = cy + y1 * scale
+        return px, py, z2
 
     def paintEvent(self, _):
         p = QPainter(self)
@@ -464,163 +443,152 @@ class HudCanvas(QWidget):
         W, H = self.width(), self.height()
         cx, cy = W / 2, H / 2
         fw = min(W, H)
+        orb_r = (fw * 0.32) * self._scale
 
-        # ── Background grid & subtle neural dot matrix ─────────────────────
-        p.setPen(QPen(qcol(C.PRI_GHO), 1))
-        for x in range(0, W, 36):
-            for y in range(0, H, 36):
-                p.drawPoint(x, y)
-
-        # ── Ambient Radial Glow ──────────────────────────────────────────────
-        r_glow = fw * 0.44
+        # ── Background Ambient Glow ──────────────────────────────────────
+        r_glow = orb_r * 1.5
         radial = QRadialGradient(QPointF(cx, cy), r_glow)
         if self.muted:
-            radial.setColorAt(0.0, qcol(C.RED, 50))
-            radial.setColorAt(1.0, qcol(C.BG, 0))
+            radial.setColorAt(0.0, qcol(C.RED, 70))
         elif self.speaking:
-            radial.setColorAt(0.0, qcol(C.ACC, 80))
-            radial.setColorAt(0.5, qcol(C.ACC2, 35))
-            radial.setColorAt(1.0, qcol(C.BG, 0))
+            radial.setColorAt(0.0, qcol(C.ACC, 110))
+            radial.setColorAt(0.5, qcol(C.ACC2, 40))
+        elif self.state == "THINKING":
+            radial.setColorAt(0.0, qcol(C.ACC2, 90))
         else:
-            radial.setColorAt(0.0, qcol(C.PRI, 45))
-            radial.setColorAt(1.0, qcol(C.BG, 0))
-
+            radial.setColorAt(0.0, qcol(C.PRI, 55))
+        radial.setColorAt(1.0, qcol(C.BG, 0))
         p.setBrush(QBrush(radial))
         p.setPen(Qt.PenStyle.NoPen)
         p.drawEllipse(QRectF(cx - r_glow, cy - r_glow, r_glow * 2, r_glow * 2))
 
-        # ── Interactive Neural Constellation Network (Lines connecting nodes) ──
-        n_pts = len(self._particles)
-        for i in range(n_pts):
-            p1 = self._particles[i]
-            for j in range(i + 1, n_pts):
-                p2 = self._particles[j]
-                dx = p1[0] - p2[0]
-                dy = p1[1] - p2[1]
-                dist = math.hypot(dx, dy)
-                if dist < 85:
-                    alpha = int(180 * (1.0 - dist / 85))
-                    p.setPen(QPen(qcol(C.ACC2 if (i + j) % 2 == 0 else C.PRI, alpha), 1))
-                    p.drawLine(QPointF(p1[0], p1[1]), QPointF(p2[0], p2[1]))
+        # ── Layer 1: 3D Outer Wireframe Latitude Rings ─────────────────
+        primary_col = qcol(C.RED if self.muted else (C.ACC2 if self.state == "THINKING" else C.ACC))
+        mid_col = qcol(C.PRI)
 
-        # ── Outer Holographic Dashed Boundary Ring ───────────────────────────
-        r_out = fw * 0.42
-        p.setPen(QPen(qcol(C.BORDER_B, 120), 1.2, Qt.PenStyle.DashLine))
-        p.setBrush(Qt.BrushStyle.NoBrush)
-        p.drawEllipse(QRectF(cx - r_out, cy - r_out, r_out * 2, r_out * 2))
+        for i in range(-12, 13):
+            lat = (i / 13.0) * (math.pi / 2.0) * 0.95
+            cos_lat, sin_lat = math.cos(lat), math.sin(lat)
+            pts = []
+            for j in range(37):
+                lon = (j / 36.0) * math.pi * 2.0
+                x = cos_lat * math.cos(lon)
+                y = sin_lat
+                z = cos_lat * math.sin(lon)
+                px, py, z_depth = self._project_3d(x, y, z, cx, cy, orb_r)
+                pts.append((px, py, z_depth))
 
-        # ── Fluid Orbital Node Rings (Slim transparent arcs with orbiting nodes)
-        for idx, (r_frac, arc_len) in enumerate([(0.36, 110), (0.28, 140), (0.20, 90)]):
-            ring_r = fw * r_frac
-            base_angle = self._rings[idx]
-            col = qcol(C.RED if self.muted else (C.ACC if idx == 0 else C.PRI), 170)
-            p.setPen(QPen(col, 1.2))
-            rect = QRectF(cx - ring_r, cy - ring_r, ring_r * 2, ring_r * 2)
-            p.drawArc(rect, int(base_angle * 16), int(arc_len * 16))
-            p.drawArc(rect, int((base_angle + 180) * 16), int((arc_len - 20) * 16))
+            for j in range(len(pts) - 1):
+                p1, p2 = pts[j], pts[j + 1]
+                avg_z = (p1[2] + p2[2]) / 2.0
+                alpha = int(max(20, min(220, 120 + avg_z * 70)))
+                col = primary_col if i % 3 == 0 else mid_col
+                p.setPen(QPen(qcol(col.name(), alpha), 1.2 if i % 3 == 0 else 0.8))
+                p.drawLine(QPointF(p1[0], p1[1]), QPointF(p2[0], p2[1]))
 
-            # Orbiting Node Point
-            dot_rad = math.radians(base_angle)
-            nx = cx + ring_r * math.cos(dot_rad)
-            ny = cy + ring_r * math.sin(dot_rad)
-            p.setBrush(QBrush(qcol(C.WHITE if not self.muted else C.RED)))
-            p.setPen(Qt.PenStyle.NoPen)
-            p.drawEllipse(QPointF(nx, ny), 3, 3)
+        # ── Layer 2: 3D Longitude Meridians ─────────────────────────────
+        for i in range(16):
+            lon = (i / 16.0) * math.pi * 2.0
+            pts = []
+            for j in range(25):
+                lat = (j / 24.0) * math.pi - (math.pi / 2.0)
+                cos_lat, sin_lat = math.cos(lat), math.sin(lat)
+                x = cos_lat * math.cos(lon)
+                y = sin_lat
+                z = cos_lat * math.sin(lon)
+                px, py, z_depth = self._project_3d(x, y, z, cx, cy, orb_r)
+                pts.append((px, py, z_depth))
 
-        # ── Dynamic Siri / AI Interactive Sine Wave Oscilloscope Mesh ─────────
-        wave_width = fw * 0.72
-        x_start = cx - wave_width / 2
-        amp_base = 32 if self.speaking else (18 if self.state == "LISTENING" else 10)
+            for j in range(len(pts) - 1):
+                p1, p2 = pts[j], pts[j + 1]
+                avg_z = (p1[2] + p2[2]) / 2.0
+                alpha = int(max(15, min(200, 100 + avg_z * 60)))
+                p.setPen(QPen(qcol(mid_col.name(), alpha), 0.9))
+                p.drawLine(QPointF(p1[0], p1[1]), QPointF(p2[0], p2[1]))
 
-        wave_colors = [
-            (qcol(C.ACC, 230), qcol(C.ACC, 30)),
-            (qcol(C.ACC2, 200), qcol(C.ACC2, 25)),
-            (qcol(C.GREEN if not self.muted else C.RED, 180), qcol(C.GREEN if not self.muted else C.RED, 20))
+        # ── Layer 3: 3D Inner Spiral Geodesic Core ─────────────────────
+        core_r = orb_r * 0.45
+        for s in range(6):
+            phase = (s / 6.0) * math.pi * 2.0
+            pts = []
+            for j in range(80):
+                t = j / 80.0
+                lat = t * math.pi - (math.pi / 2.0)
+                lon = t * 3.5 * math.pi * 2.0 + phase - self._rot_y * 1.5
+                x = math.cos(lat) * math.cos(lon)
+                y = math.sin(lat)
+                z = math.cos(lat) * math.sin(lon)
+                px, py, z_depth = self._project_3d(x, y, z, cx, cy, core_r)
+                pts.append((px, py, z_depth))
+
+            for j in range(len(pts) - 1):
+                p1, p2 = pts[j], pts[j + 1]
+                avg_z = (p1[2] + p2[2]) / 2.0
+                alpha = int(max(30, min(255, 140 + avg_z * 80)))
+                p.setPen(QPen(qcol(C.ACC if s % 2 == 0 else C.WHITE, alpha), 1.4))
+                p.drawLine(QPointF(p1[0], p1[1]), QPointF(p2[0], p2[1]))
+
+        # ── Layer 4: Center 3D Wireframe Icosahedron Core ─────────────
+        ico_r = orb_r * 0.18 * (1.3 if self.speaking else 1.0)
+        phi = (1.0 + math.sqrt(5.0)) / 2.0
+        verts = [
+            (-1, phi, 0), (1, phi, 0), (-1, -phi, 0), (1, -phi, 0),
+            (0, -1, phi), (0, 1, phi), (0, -1, -phi), (0, 1, -phi),
+            (phi, 0, -1), (phi, 0, 1), (-phi, 0, -1), (-phi, 0, 1)
+        ]
+        verts = [(v[0]/2.0, v[1]/2.0, v[2]/2.0) for v in verts]
+        edges = [
+            (0,11),(0,5),(0,1),(0,7),(0,10),(1,2),(1,3),(1,8),(1,9),
+            (2,3),(2,4),(2,6),(2,10),(3,4),(3,5),(3,8),(4,5),(4,9),
+            (5,9),(5,11),(6,7),(6,8),(6,10),(7,8),(7,10),(8,9),(10,11)
         ]
 
-        for w_i, (w_col, fill_col) in enumerate(wave_colors):
-            path = QPainterPath()
-            phase = self._tick * 0.08 + w_i * 1.2
-            freq = 0.025 + w_i * 0.005
-            amp = amp_base * (1.0 + 0.35 * math.sin(phase))
+        proj_verts = []
+        for vx, vy, vz in verts:
+            px, py, zd = self._project_3d(vx, vy, vz, cx, cy, ico_r)
+            proj_verts.append((px, py, zd))
 
-            path.moveTo(x_start, cy)
-            step = 4
-            for x_off in range(0, int(wave_width), step):
-                px = x_start + x_off
-                env = math.sin((x_off / wave_width) * math.pi)
-                py = cy + math.sin(x_off * freq + phase) * amp * env
-                path.lineTo(px, py)
+        p.setPen(QPen(qcol(C.WHITE), 1.8))
+        for e1, e2 in edges:
+            if e1 < len(proj_verts) and e2 < len(proj_verts):
+                p1, p2 = proj_verts[e1], proj_verts[e2]
+                p.drawLine(QPointF(p1[0], p1[1]), QPointF(p2[0], p2[1]))
 
-            # Draw filled translucent wave glow
-            fill_path = QPainterPath(path)
-            fill_path.lineTo(cx + wave_width / 2, cy)
-            fill_path.lineTo(x_start, cy)
-            p.setBrush(QBrush(fill_col))
-            p.setPen(Qt.PenStyle.NoPen)
-            p.drawPath(fill_path)
-
-            p.setPen(QPen(w_col, 2.0 if w_i == 0 else 1.5))
-            p.setBrush(Qt.BrushStyle.NoBrush)
-            p.drawPath(path)
-
-        # ── Interactive Mouse Reticle Target Tracker ────────────────────────
-        mx, my = self._mouse_pos.x(), self._mouse_pos.y()
-        if 0 <= mx <= W and 0 <= my <= H:
-            p.setPen(QPen(qcol(C.ACC, 180), 1.2))
-            p.setBrush(Qt.BrushStyle.NoBrush)
-            p.drawEllipse(QRectF(mx - 12, my - 12, 24, 24))
-            p.drawLine(QPointF(mx - 18, my), QPointF(mx + 18, my))
-            p.drawLine(QPointF(mx, my - 18), QPointF(mx, my + 18))
-
-        # ── Central AI Typography ───────────────────────────────────────────
+        # ── Central AI Title Typography ───────────────────────────────
         p.setPen(QPen(qcol(C.WHITE if not self.muted else C.RED), 1))
         p.setFont(QFont("Segoe UI", 15, QFont.Weight.Bold))
-        p.drawText(QRectF(cx - 100, cy - 14, 200, 28),
+        p.drawText(QRectF(cx - 120, cy - 14, 240, 28),
                    Qt.AlignmentFlag.AlignCenter, self._assistant_name)
 
-        # ── Floating Particle Swarm (Neural Nodes) ───────────────────────────
-        for pt in self._particles:
-            a = max(0, min(255, int(pt[4] * 255)))
-            p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(QBrush(qcol(C.ACC2 if random.random() < 0.3 else C.PRI, a)))
-            p.drawEllipse(QPointF(pt[0], pt[1]), 2.5, 2.5)
-
-        # ── Bottom AI State & Status Indicator ──────────────────────────────
-        sy = cy + fw * 0.40
+        # ── Status Text ───────────────────────────────────────────────
+        sy = cy + orb_r + 32
         if self.muted:
-            txt, col = "⊘  MUTED",     qcol(C.MUTED_C)
+            txt, col = "⊘  MUTED", qcol(C.MUTED_C)
         elif self.speaking:
-            txt, col = "●  SPEAKING",  qcol(C.ACC)
+            txt, col = "●  SPEAKING", qcol(C.ACC)
         elif self.state == "THINKING":
-            sym = "◈" if self._blink else "◇"
-            txt, col = f"{sym}  THINKING",   qcol(C.ACC2)
-        elif self.state == "PROCESSING":
-            sym = "▷" if self._blink else "▶"
-            txt, col = f"{sym}  PROCESSING", qcol(C.ACC2)
+            txt, col = "◈  THINKING...", qcol(C.ACC2)
         elif self.state == "LISTENING":
-            sym = "●" if self._blink else "○"
-            txt, col = f"{sym}  LISTENING",  qcol(C.GREEN)
+            txt, col = "●  LISTENING", qcol(C.GREEN)
         else:
-            sym = "●" if self._blink else "○"
-            txt, col = f"{sym}  {self.state}", qcol(C.PRI)
+            txt, col = f"●  {self.state}", qcol(C.PRI)
 
         p.setPen(QPen(col, 1))
         p.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
         p.drawText(QRectF(0, sy, W, 26), Qt.AlignmentFlag.AlignCenter, txt)
 
-        # ── Fluid Responsive Waveform Visualizer ─────────────────────────────
+        # ── Audio Frequency Bar Visualizer Array ─────────────────────
         wy = sy + 28
-        N, bw = 36, 6
+        N, bw = 32, 6
         tot_w = N * bw
         sx = cx - tot_w / 2
         p.setPen(Qt.PenStyle.NoPen)
         for i in range(N):
             if self.speaking:
-                h = random.randint(4, 22)
+                h = random.randint(4, 24)
                 c = qcol(C.ACC if i % 2 == 0 else C.PRI)
             elif self.state == "LISTENING":
-                h = int(3 + math.sin(self._tick * 0.15 + i * 0.4) * 5)
+                h = int(3 + math.sin(self._tick * 0.18 + i * 0.4) * 6)
                 c = qcol(C.GREEN)
             else:
                 h = 2
@@ -2651,10 +2619,13 @@ class MainWindow(QMainWindow):
         body.addWidget(self._left_panel, stretch=0)
 
         # Center column: HUD + resizable content panel via QSplitter
-        self.hud = HudCanvas(face_path, _display)
+        if _HAS_ULTRON_ORB:
+            self.hud = UltronOrbGL(_display)
+        else:
+            self.hud = HudCanvas(face_path, _display)
+            self.hud.on_clicked = self._do_interrupt
         self.hud.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.hud.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.hud.on_clicked = self._do_interrupt
         self._content_panel = self._build_content_panel()
 
         # Live camera container — replaces HUD when camera stream is active
@@ -4445,23 +4416,22 @@ class MainWindow(QMainWindow):
 
     def _do_interrupt(self):
         now = time.time()
-        # A physical ESC is received through both the Qt shortcut and the
-        # global Windows hook. Treat that near-simultaneous duplicate as one
-        # press; keep the normal 500 ms window for a real double ESC.
         last_dispatch = getattr(self, "_last_esc_dispatch", 0.0)
-        if (now - last_dispatch) < 0.08:
+        # Any signal within 280ms is a duplicate between QShortcut and the global Windows hook.
+        if (now - last_dispatch) < 0.28:
             return
         self._last_esc_dispatch = now
         last = getattr(self, "_last_esc_time", 0.0)
         self._last_esc_time = now
-        is_double_esc = (now - last) < 0.5
+
+        # A real double ESC requires an intentional second tap between 280ms and 650ms.
+        is_double_esc = (0.28 <= (now - last) < 0.65)
+        if is_double_esc:
+            self._last_esc_time = 0.0  # reset so a 3rd press doesn't re-trigger double
 
         if self.on_interrupt:
-            # Single ESC stops only speech. Double ESC also clears pending
-            # input; neither action permanently mutes the microphone.
             self.on_interrupt(flush_mic=is_double_esc)
 
-        # Double-ESC within 500ms = full mic flush + notify user
         if is_double_esc:
             self._log.append_log("SYS: ⚡ Double-ESC — full mic & queue reset.")
             print("[TITAN] ⚡ Double-ESC — full mic + speaker flush complete")
@@ -4471,7 +4441,6 @@ class MainWindow(QMainWindow):
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key.Key_Escape:
-            self._do_interrupt()
             event.accept()
             return
         super().keyPressEvent(event)
